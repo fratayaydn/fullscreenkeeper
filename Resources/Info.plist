@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.fratayaydn.fullscreenkeeper</string>
+    <key>CFBundleName</key>
+    <string>FullscreenKeeper</string>
+    <key>CFBundleDisplayName</key>
+    <string>FullscreenKeeper</string>
+    <key>CFBundleExecutable</key>
+    <string>FullscreenKeeper</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>VERSION</string>
+    <key>CFBundleVersion</key>
+    <string>VERSION</string>
+    <key>FKBuildID</key>
+    <string>BUILD_ID</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>MIT License</string>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>io.github.fratayaydn.fullscreenkeeper.remembered-apps</string>
+            <key>UTTypeDescription</key>
+            <string>Remembered Apps</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string></array>
+        </dict>
+    </array>
+</dict>
+</plist>
