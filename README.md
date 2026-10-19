@@ -149,8 +149,8 @@ source, `make uninstall` in the cloned folder removes both the app and the setti
 - [BalanceKeeper](https://github.com/fratayaydn/balancekeeper): puts the left/right audio balance back when macOS
   shifts it
 - [CapsNow](https://github.com/fratayaydn/capsnow): turns off the Caps Lock delay, so quick taps register
-- [MicKeeper](https://github.com/fratayaydn/mickeeper): keeps the microphone and its level where you want them,
-  without making AirPods sound like a phone call
+- [MicKeeper](https://github.com/fratayaydn/mickeeper): keeps AirPods and iPhones off the microphone, so AirPods don't
+  drop to call quality
 
 ## License
 
