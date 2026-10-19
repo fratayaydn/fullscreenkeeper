@@ -5,7 +5,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 NSString * _Nullable updaterVersion(id _Nullable value);
 NSComparisonResult updaterCompareVersions(NSString *left, NSString *right);
-BOOL updaterHomebrewAtRoot(NSString *root);
 BOOL updaterCheckDue(id _Nullable lastCheck, NSDate *now, id _Nullable lastBuild,
                      NSString * _Nullable currentBuild, BOOL enabled, BOOL force);
 NSString *updaterAssetName(NSString *version);

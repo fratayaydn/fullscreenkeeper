@@ -54,7 +54,8 @@ also runs at the first login after a macOS update, in case a fix for that versio
 The check is one request to `api.github.com` that sends only the app name and version. macOS asks once whether
 FullscreenKeeper may show a notification after an update; you can change that later in **System Settings >
 Notifications**. Turn off **Install updates automatically** to get a notification instead and install from the
-window. If you installed with Homebrew, the app leaves updates to `brew upgrade`.
+window. Homebrew installs update themselves too. The cask is marked as auto-updating, so `brew upgrade` skips it
+unless you add `--greedy`.
 
 ## Good to know
 

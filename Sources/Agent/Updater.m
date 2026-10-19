@@ -17,7 +17,6 @@ static NSString *const GitHubRepo = @"fullscreenkeeper";
 static NSString *const AppName = @"FullscreenKeeper";
 static NSString *const BundleID = @"io.github.fratayaydn.fullscreenkeeper";
 static NSString *const TeamID = @"GYWRX9QZZD";
-static NSString *const HomebrewCask = @"fullscreenkeeper";
 
 static os_log_t updateLog(void) {
     static os_log_t log;
@@ -52,15 +51,6 @@ NSComparisonResult updaterCompareVersions(NSString *left, NSString *right) {
         if (result != NSOrderedSame) return result;
     }
     return NSOrderedSame;
-}
-
-BOOL updaterHomebrewAtRoot(NSString *root) {
-    for (NSString *prefix in @[@"opt/homebrew/Caskroom", @"usr/local/Caskroom"]) {
-        BOOL directory = NO;
-        NSString *path = [[root stringByAppendingPathComponent:prefix] stringByAppendingPathComponent:HomebrewCask];
-        if ([NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&directory] && directory) return YES;
-    }
-    return NO;
 }
 
 BOOL updaterCheckDue(id lastCheck, NSDate *now, id lastBuild, NSString *currentBuild, BOOL enabled, BOOL force) {
@@ -374,7 +364,6 @@ static BOOL installRelease(NSURLSession *session, NSDictionary *release, NSStrin
 
 int updaterRun(BOOL force, BOOL install) {
     os_log_info(updateLog(), "Update check started");
-    if (updaterHomebrewAtRoot(@"/")) { os_log_info(updateLog(), "Homebrew manages updates; skipping"); return 0; }
     CFPreferencesAppSynchronize((__bridge CFStringRef)BundleID);
     char build[256] = {0};
     size_t size = sizeof(build);

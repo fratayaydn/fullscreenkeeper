@@ -1,6 +1,6 @@
 # FullscreenKeeper: `make` builds .build/FullscreenKeeper.app (hidden, so Spotlight does not list the build copy), `make install` copies it to /Applications and opens it.
 # `make dmg` builds the disk image; `make release` builds, notarizes and staples it (Developer ID required).
-VERSION  := 1.0.0
+VERSION  := 1.0.1
 BUILD    ?= .build
 APP      := $(BUILD)/FullscreenKeeper.app
 STAGE    := $(BUILD)/stage/FullscreenKeeper.app

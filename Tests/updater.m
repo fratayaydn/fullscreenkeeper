@@ -20,31 +20,6 @@ static void versions(void) {
     assert(updaterCompareVersions(@"1.999999999999999999999999.0", @"1.10.0") == NSOrderedDescending);
 }
 
-static void homebrew(void) {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSURL *root = [NSURL fileURLWithPath:[[NSFileManager.defaultManager currentDirectoryPath]
-        stringByAppendingPathComponent:[@".build/updater-fixture-" stringByAppendingString:NSUUID.UUID.UUIDString]]];
-    assert([fm createDirectoryAtURL:root withIntermediateDirectories:YES attributes:nil error:NULL]);
-    @try {
-        assert(!updaterHomebrewAtRoot(root.path));
-        for (NSString *path in @[@"opt/homebrew/Caskroom/fullscreenkeeper", @"usr/local/Caskroom/fullscreenkeeper"]) {
-            NSURL *cask = [root URLByAppendingPathComponent:path];
-            assert([fm createDirectoryAtURL:cask.URLByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL]);
-            assert([fm createFileAtPath:cask.path contents:NSData.data attributes:nil]);
-            assert(!updaterHomebrewAtRoot(root.path));
-            assert([fm removeItemAtURL:cask error:NULL]);
-            assert([fm createDirectoryAtURL:cask withIntermediateDirectories:NO attributes:nil error:NULL]);
-            assert(updaterHomebrewAtRoot(root.path));
-            assert([fm removeItemAtURL:cask error:NULL]);
-        }
-        NSURL *other = [root URLByAppendingPathComponent:@"opt/homebrew/Caskroom/other-app"];
-        assert([fm createDirectoryAtURL:other withIntermediateDirectories:YES attributes:nil error:NULL]);
-        assert(!updaterHomebrewAtRoot(root.path));
-    } @finally {
-        assert([fm removeItemAtURL:root error:NULL]);
-    }
-}
-
 static void scheduling(void) {
     NSDate *now = [NSDate dateWithTimeIntervalSince1970:1000000];
     assert(updaterCheckDue(nil, now, @"25A1", @"25A1", YES, NO));
@@ -75,7 +50,6 @@ static void assetSizes(void) {
 int main(void) {
     @autoreleasepool {
         versions();
-        homebrew();
         scheduling();
         assetSizes();
         assert([updaterAssetName(@"1.2.3") isEqual:@"FullscreenKeeper-1.2.3.dmg"]);
@@ -85,7 +59,7 @@ int main(void) {
         SecRequirementRef compiled = NULL;
         assert(SecRequirementCreateWithString((__bridge CFStringRef)requirement, kSecCSDefaultFlags, &compiled) == errSecSuccess);
         CFRelease(compiled);
-        puts("Passed updater checks: numeric versions, Homebrew paths, 20 hour and OS build scheduling, asset name, size limits and notarized developer requirement; no network access.");
+        puts("Passed updater checks: numeric versions, 20 hour and OS build scheduling, asset name, size limits and notarized developer requirement; no network access.");
     }
     return 0;
 }

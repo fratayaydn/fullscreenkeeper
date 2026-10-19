@@ -131,10 +131,6 @@ final class Model: ObservableObject {
     @Published var lastUpdateCheck: Date?
     @Published var spaceEventsPath: String?
     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
-    let homebrew = ["/opt/homebrew/Caskroom/fullscreenkeeper", "/usr/local/Caskroom/fullscreenkeeper"].contains { path in
-        var directory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
-    }
 
     private let defaults = UserDefaults.standard
     private let agent = SMAppService.agent(plistName: agentPlistName)
@@ -467,24 +463,20 @@ struct ContentView: View {
                 }
             }
             Section("Updates") {
-                if model.homebrew {
-                    Text("Installed with Homebrew. Update with brew upgrade.")
-                } else {
-                    Toggle(isOn: Binding(get: { model.automaticUpdates }, set: { model.setAutomaticUpdates($0) })) {
-                        Text("Install updates automatically")
-                        Text("Only updates signed by the developer and notarized by Apple.")
-                    }
-                    HStack {
-                        Text("Version \(model.version), \(model.lastCheckedText.lowercased().replacingOccurrences(of: "checked:", with: "checked"))")
-                            .lineLimit(1)
-                        Spacer()
-                        Button(model.checkingUpdates ? "Checking..." : "Check Now") { model.checkUpdates() }
-                            .disabled(model.checkingUpdates)
-                    }
-                    if !model.automaticUpdates, let version = model.availableVersion {
-                        Button("Install \(version)") { model.checkUpdates(install: true) }
-                            .disabled(model.checkingUpdates)
-                    }
+                Toggle(isOn: Binding(get: { model.automaticUpdates }, set: { model.setAutomaticUpdates($0) })) {
+                    Text("Install updates automatically")
+                    Text("Only updates signed by the developer and notarized by Apple.")
+                }
+                HStack {
+                    Text("Version \(model.version), \(model.lastCheckedText.lowercased().replacingOccurrences(of: "checked:", with: "checked"))")
+                        .lineLimit(1)
+                    Spacer()
+                    Button(model.checkingUpdates ? "Checking..." : "Check Now") { model.checkUpdates() }
+                        .disabled(model.checkingUpdates)
+                }
+                if !model.automaticUpdates, let version = model.availableVersion {
+                    Button("Install \(version)") { model.checkUpdates(install: true) }
+                        .disabled(model.checkingUpdates)
                 }
             }
         }
