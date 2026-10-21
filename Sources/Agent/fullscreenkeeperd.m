@@ -3,12 +3,16 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <IOKit/hid/IOHIDManager.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
+#include <Carbon/Carbon.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <os/log.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include "Policy.h"
 #import "Updater.h"
@@ -16,6 +20,8 @@
 #define PREFS_DOMAIN CFSTR("io.github.fratayaydn.fullscreenkeeper")
 #define KEY_APPLICATIONS CFSTR("Applications")
 #define KEY_IGNORED_APPLICATIONS CFSTR("IgnoredApplications")
+#define KEY_REOPEN_IN_FULL_SCREEN CFSTR("ReopenInFullScreen")
+#define KEY_FORCE_FN_F CFSTR("ForceFnF")
 #define AGENT_PLIST @"io.github.fratayaydn.fullscreenkeeper.agent.plist"
 #define UPDATER_PLIST @"io.github.fratayaydn.fullscreenkeeper.updater.plist"
 static NSString *const SettingsChanged = @"io.github.fratayaydn.fullscreenkeeper.SettingsChanged";
@@ -88,11 +94,31 @@ static NSMutableDictionary<NSNumber *, NSRunningApplication *> *gProtected;
 static id gActivationObserver;
 static id gTerminationObserver;
 static BOOL gTrusted;
+static BOOL gReopenInFullScreen;
+static BOOL gReopenRunning;
+static uint64_t gReopenGeneration;
+static id gLaunchObserver, gSpaceObserver;
+static BOOL gAppKitEventPump;
+static BOOL gAgentRunLoopStarted;
+static BOOL gApplyingSettings;
+static BOOL gForceFnF;
+static BOOL gInputMonitoringGranted;
+static IOHIDManagerRef gFnFHID;
+static CFMachPortRef gFnFKeyTap;
+static CFRunLoopSourceRef gFnFKeySource;
+static BOOL gFnFKeyTapEnabled, gFnFDown;
+static double gFnFKeyTapNextRecovery;
+static dispatch_block_t gFnFReleaseTimeout;
+static uint64_t gFnFReleaseGeneration;
+static BOOL gFnFSwallowedDown;
+static NSMutableDictionary<NSNumber *, NSString *> *gFnFBundleIDs;
+static id gFnFLaunchObserver, gFnFTerminationObserver;
 static pid_t gPreviousSpacePID;
 static dispatch_source_t gBundleWatch;
 static char gExecutable[PATH_MAX];
 static double now(void) { return NSProcessInfo.processInfo.systemUptime; }
 static void updateTerminationObserver(void);
+static void loadSettings(void);
 
 static os_log_t agentLog(void) {
     static os_log_t log;
@@ -129,6 +155,189 @@ static WindowState booleanAttribute(AXUIElementRef element, CFStringRef key, AXE
     if (!value || CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) return StateUnknown;
     return [value boolValue] ? StateFullscreen : StateWindowed;
 }
+
+#pragma mark - Force fn-F
+
+_Static_assert(FnFFunctionMask == kCGEventFlagMaskSecondaryFn && FnFShiftMask == kCGEventFlagMaskShift &&
+               FnFControlMask == kCGEventFlagMaskControl && FnFOptionMask == kCGEventFlagMaskAlternate &&
+               FnFCommandMask == kCGEventFlagMaskCommand && kVK_ANSI_F == 3, "fn-F policy constants");
+
+static void toggleFocusedFullscreen(pid_t pid, NSString *bundleID) {
+    if (!gForceFnF || !gTrusted || !gFnFHID) return;
+    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (!app || app.terminated || ![app.bundleIdentifier isEqualToString:bundleID] ||
+        [bundleID isEqualToString:(__bridge NSString *)PREFS_DOMAIN]) return;
+    AXUIElementRef element = AXUIElementCreateApplication(pid);
+    AXUIElementSetMessagingTimeout(element, 0.25);
+    AXError failure = kAXErrorSuccess;
+    id focused = attribute(element, kAXFocusedWindowAttribute, &failure);
+    CFRelease(element);
+    WindowState state = StateUnknown;
+    Boolean writable = false;
+    if (focused && CFGetTypeID((__bridge CFTypeRef)focused) == AXUIElementGetTypeID()) {
+        AXUIElementRef window = (__bridge AXUIElementRef)focused;
+        AXUIElementSetMessagingTimeout(window, 0.25);
+        state = booleanAttribute(window, CFSTR("AXFullScreen"), &failure);
+        if (state != StateUnknown)
+            failure = AXUIElementIsAttributeSettable(window, CFSTR("AXFullScreen"), &writable);
+        if (failure == kAXErrorSuccess && writable && !app.terminated) {
+            AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"),
+                                          state == StateFullscreen ? kCFBooleanFalse : kCFBooleanTrue);
+            return;
+        }
+    }
+}
+
+static void setFnFTapEnabled(CFMachPortRef tap, BOOL *intended, BOOL enabled) {
+    if (*intended == enabled) return;
+    // Store intent first because disabling can deliver a callback immediately.
+    *intended = enabled;
+    if (tap) CGEventTapEnable(tap, enabled);
+}
+
+static BOOL fnFTapDisabled(CGEventType type, CFMachPortRef tap, BOOL intended, double *nextRecovery) {
+    // This includes the notification produced by our own disable operation.
+    if (type == kCGEventTapDisabledByUserInput) return YES;
+    if (type != kCGEventTapDisabledByTimeout) return NO;
+    if (tap && intended && gForceFnF && gTrusted && gInputMonitoringGranted) {
+        double time = now();
+        if (time >= *nextRecovery) {
+            *nextRecovery = time + 1.0;
+            CGEventTapEnable(tap, true);
+        }
+    }
+    return YES;
+}
+
+static void cancelFnFReleaseTimeout(void) {
+    gFnFReleaseGeneration++;
+    if (gFnFReleaseTimeout) dispatch_block_cancel(gFnFReleaseTimeout);
+    gFnFReleaseTimeout = nil;
+}
+
+static void fnFValueChanged(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
+    (void)context; (void)sender;
+    if (result != kIOReturnSuccess || !gFnFHID || !gForceFnF || !gTrusted || !gInputMonitoringGranted) return;
+    IOHIDElementRef element = IOHIDValueGetElement(value);
+    uint32_t page = IOHIDElementGetUsagePage(element);
+    if ((page != 0xFF && page != 0xFF00) || IOHIDElementGetUsage(element) != 0x03) return;
+    CFIndex input = IOHIDValueGetIntegerValue(value);
+    if (input != 0 && input != 1) return;
+    BOOL down = input == 1;
+    if (gFnFDown == down) return;
+    gFnFDown = down;
+    cancelFnFReleaseTimeout();
+    if (!down && gFnFSwallowedDown) {
+        // Keep swallowing F until its release, even when fn is released first.
+        uint64_t generation = gFnFReleaseGeneration;
+        gFnFReleaseTimeout = dispatch_block_create(0, ^{
+            if (generation != gFnFReleaseGeneration) return;
+            gFnFReleaseTimeout = nil;
+            gFnFSwallowedDown = NO;
+            setFnFTapEnabled(gFnFKeyTap, &gFnFKeyTapEnabled, NO);
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), gFnFReleaseTimeout);
+    }
+    setFnFTapEnabled(gFnFKeyTap, &gFnFKeyTapEnabled, down || gFnFSwallowedDown);
+}
+
+static CGEventRef fnFKeyEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
+    (void)proxy; (void)context;
+    if (fnFTapDisabled(type, gFnFKeyTap, gFnFKeyTapEnabled, &gFnFKeyTapNextRecovery)) return event;
+    if (type != kCGEventKeyDown && type != kCGEventKeyUp) return event;
+    if (!gFnFKeyTapEnabled || !gForceFnF || !gTrusted || !gInputMonitoringGranted) return event;
+    unsigned keycode = (unsigned)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+    if (keycode != kVK_ANSI_F) return event;
+    pid_t pid = (pid_t)CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID);
+    NSString *bundleID = gFnFBundleIDs[@(pid)];
+    BOOL unknownOrSelf = !bundleID.length ||
+                         [bundleID isEqualToString:(__bridge NSString *)PREFS_DOMAIN];
+    FnFAction action = fnFAction(keycode, CGEventGetFlags(event), type == kCGEventKeyDown,
+                                CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) != 0,
+                                unknownOrSelf, gFnFSwallowedDown);
+    if (action == FnFPass) return event;
+    gFnFSwallowedDown = type == kCGEventKeyDown;
+    if (!gFnFSwallowedDown) {
+        cancelFnFReleaseTimeout();
+        if (!gFnFDown) setFnFTapEnabled(gFnFKeyTap, &gFnFKeyTapEnabled, NO);
+    }
+    if (action == FnFToggle) dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool { toggleFocusedFullscreen(pid, bundleID); }
+    });
+    return NULL;
+}
+
+static void stopFnFTaps(void) {
+    cancelFnFReleaseTimeout();
+    setFnFTapEnabled(gFnFKeyTap, &gFnFKeyTapEnabled, NO);
+    if (gFnFHID) {
+        IOHIDManagerUnscheduleFromRunLoop(gFnFHID, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+        IOHIDManagerClose(gFnFHID, kIOHIDOptionsTypeNone);
+        CFRelease(gFnFHID);
+        gFnFHID = NULL;
+    }
+    if (gFnFKeyTap) CFMachPortInvalidate(gFnFKeyTap);
+    if (gFnFKeySource) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), gFnFKeySource, kCFRunLoopCommonModes);
+        CFRelease(gFnFKeySource);
+        gFnFKeySource = NULL;
+    }
+    if (gFnFKeyTap) { CFRelease(gFnFKeyTap); gFnFKeyTap = NULL; }
+    gFnFKeyTapNextRecovery = 0;
+    gFnFSwallowedDown = gFnFDown = NO;
+    NSNotificationCenter *center = NSWorkspace.sharedWorkspace.notificationCenter;
+    if (gFnFLaunchObserver) [center removeObserver:gFnFLaunchObserver];
+    if (gFnFTerminationObserver) [center removeObserver:gFnFTerminationObserver];
+    gFnFLaunchObserver = gFnFTerminationObserver = nil;
+    gFnFBundleIDs = nil;
+}
+
+static void cacheFnFApplication(NSRunningApplication *app) {
+    if (app.bundleIdentifier.length && !app.terminated)
+        gFnFBundleIDs[@(app.processIdentifier)] = app.bundleIdentifier;
+}
+
+static void updateFnFTaps(void) {
+    gInputMonitoringGranted = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted;
+    if (!gForceFnF || !gTrusted || !gInputMonitoringGranted) { stopFnFTaps(); return; }
+    if (gFnFHID && gFnFKeyTap) return;
+    gFnFKeyTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+                                 CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp), fnFKeyEvent, NULL);
+    // Newly created taps start enabled. Disable before scheduling so no keys can arrive until fn is down.
+    gFnFKeyTapEnabled = gFnFKeyTap != NULL;
+    setFnFTapEnabled(gFnFKeyTap, &gFnFKeyTapEnabled, NO);
+    if (gFnFKeyTap) gFnFKeySource = CFMachPortCreateRunLoopSource(NULL, gFnFKeyTap, 0);
+    if (!gFnFKeySource) { stopFnFTaps(); return; }
+    gFnFHID = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    if (!gFnFHID) { stopFnFTaps(); return; }
+    // Filter elements before scheduling or opening: other keys never enter the HID queues.
+    IOHIDManagerSetInputValueMatchingMultiple(gFnFHID, (__bridge CFArrayRef)@[
+        @{ @kIOHIDElementUsagePageKey: @0xFF, @kIOHIDElementUsageKey: @0x03 },
+        @{ @kIOHIDElementUsagePageKey: @0xFF00, @kIOHIDElementUsageKey: @0x03 }
+    ]);
+    IOHIDManagerSetDeviceMatching(gFnFHID, (__bridge CFDictionaryRef)@{
+        @kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop),
+        @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Keyboard)
+    });
+    IOHIDManagerRegisterInputValueCallback(gFnFHID, fnFValueChanged, NULL);
+    IOHIDManagerScheduleWithRunLoop(gFnFHID, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+    if (IOHIDManagerOpen(gFnFHID, kIOHIDOptionsTypeNone) != kIOReturnSuccess) { stopFnFTaps(); return; }
+    gFnFBundleIDs = [NSMutableDictionary dictionary];
+    for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) cacheFnFApplication(app);
+    NSNotificationCenter *center = NSWorkspace.sharedWorkspace.notificationCenter;
+    gFnFLaunchObserver = [center addObserverForName:NSWorkspaceDidLaunchApplicationNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            cacheFnFApplication(note.userInfo[NSWorkspaceApplicationKey]);
+        }];
+    gFnFTerminationObserver = [center addObserverForName:NSWorkspaceDidTerminateApplicationNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
+            if (app) [gFnFBundleIDs removeObjectForKey:@(app.processIdentifier)];
+        }];
+    CFRunLoopAddSource(CFRunLoopGetMain(), gFnFKeySource, kCFRunLoopCommonModes);
+}
+
+#pragma mark - Accessibility
 
 // Nonstandard and minimized windows do not contribute to the app's full-screen state.
 static WindowState windowState(AXUIElementRef window, BOOL *standard, AXError *failure) {
@@ -217,14 +426,20 @@ static void saveApplications(NSDictionary *records) {
     [[NSDistributedNotificationCenter defaultCenter] postNotificationName:StatusChanged object:nil userInfo:nil deliverImmediately:YES];
 }
 
-static void loadSettings(void) {
+// Status commands only read preferences. The running agent uses loadSettings to reconcile features too.
+static void readSettings(void) {
     for (NSNumber *pid in gProtected.allKeys)
         if (gProtected[pid].terminated) [gProtected removeObjectForKey:pid];
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    id reopenValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_REOPEN_IN_FULL_SCREEN, PREFS_DOMAIN));
+    gReopenInFullScreen = ![reopenValue isKindOfClass:[NSNumber class]] || [reopenValue boolValue];
+    id forceValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_FORCE_FN_F, PREFS_DOMAIN));
+    gForceFnF = [forceValue isKindOfClass:[NSNumber class]] && [forceValue boolValue];
     id ignoredValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_IGNORED_APPLICATIONS, PREFS_DOMAIN));
     gIgnoredApplications = [ignoredValue isKindOfClass:[NSDictionary class]] ? ignoredValue : @{};
     id value = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_APPLICATIONS, PREFS_DOMAIN));
     gApplications = [value isKindOfClass:[NSDictionary class]] ? value : @{};
+    if (!gReopenInFullScreen) return;
     NSMutableDictionary *records = [gApplications mutableCopy];
     for (NSString *bundleID in gApplications) {
         id entry = gApplications[bundleID];
@@ -242,9 +457,9 @@ static WindowState remembered(NSString *bundleID) {
 }
 
 static void saveState(NSRunningApplication *app, WindowState state) {
-    if (app.terminated || state == StateUnknown) return;
+    if (!gReopenInFullScreen || app.terminated || state == StateUnknown) return;
     loadSettings();  // merge with entries forgotten in the settings window
-    if (!eligible(app)) return;
+    if (!gReopenInFullScreen || !eligible(app)) return;
     if (remembered(app.bundleIdentifier) == state) return;
     NSMutableDictionary *records = [gApplications mutableCopy];
     if (state == StateFullscreen)
@@ -258,6 +473,7 @@ static void saveState(NSRunningApplication *app, WindowState state) {
 }
 
 static WindowState recordApplication(NSRunningApplication *app, BOOL startup, const char *phase) {
+    if (!gReopenInFullScreen) return StateUnknown;
     if (!gTrusted || !eligible(app)) {
         os_log_debug(agentLog(), "%{public}s pid=%d bundle=%{public}@ skip", phase, app.processIdentifier, app.bundleIdentifier);
         return StateUnknown;
@@ -312,6 +528,7 @@ static void updateTerminationObserver(void) {
 }
 
 static void recordSpaceApplication(NSRunningApplication *app, BOOL seriesAllowed, double changedAt) {
+    if (!gReopenInFullScreen) return;
     NSNumber *pid = @(app.processIdentifier);
     stopSpaceSeries(pid);
     WindowState state = recordApplication(app, NO, "now");
@@ -340,6 +557,7 @@ static void recordSpaceApplication(NSRunningApplication *app, BOOL seriesAllowed
 }
 
 static void recordSpaceChange(BOOL transition) {
+    if (!gReopenInFullScreen) return;
     double changedAt = now();
     NSRunningApplication *app = NSWorkspace.sharedWorkspace.frontmostApplication;
     NSNumber *pid = @(app.processIdentifier);
@@ -361,6 +579,12 @@ static void spaceChanged(void) { recordSpaceChange(NO); }
 typedef void (*ConnectionNotifyProc)(uint32_t type, void *data, size_t length, void *context, int cid);
 static CGEventRef (*gNextWindowServerEvent)(int cid);
 static int gWindowServerConnection;
+static CGError (*gRemoveConnectionNotify)(int, ConnectionNotifyProc, uint32_t, void *);
+static NSMutableSet<NSNumber *> *gSpaceNotificationTypes;
+static CFMachPortRef gSpacePort;
+static CFRunLoopSourceRef gSpaceSource;
+// Odd generations accept callbacks. Stopping invalidates queued work before removing subscriptions.
+static atomic_uint_fast64_t gSpaceEventsGeneration;
 // Only the main queue reads or writes these flags, including after setup falls back.
 static BOOL gWindowServerSpaceEvents;
 static BOOL gWindowServerTransitions;
@@ -441,6 +665,7 @@ static void seedFullscreenSpaces(void *skyLight) {
 }
 
 static void recordFullscreenSpace(uint32_t type, uint64_t sid, NSRunningApplication *frontmost) {
+    if (!gReopenInFullScreen) return;
     NSNumber *key = @(sid);
     if (type == 1327) {
         if (!gTrusted || !eligible(frontmost)) return;
@@ -477,6 +702,8 @@ static void recordFullscreenSpace(uint32_t type, uint64_t sid, NSRunningApplicat
 
 static void windowServerSpaceChanged(uint32_t type, void *data, size_t length, void *context, int cid) {
     (void)context;
+    uint_fast64_t generation = atomic_load(&gSpaceEventsGeneration);
+    if (!(generation & 1)) return;
     @autoreleasepool {
         BOOL typed = gSpaceGetType && (type == 1327 || type == 1328);
         uint64_t sid = 0;
@@ -495,7 +722,7 @@ static void windowServerSpaceChanged(uint32_t type, void *data, size_t length, v
         if (type != 1327 && type != 1328 && type != 1401) return;
         // Policy work stays on the main queue; never retain WindowServer's payload.
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gWindowServerSpaceEvents) return;
+            if (!gWindowServerSpaceEvents || generation != atomic_load(&gSpaceEventsGeneration)) return;
             // A partially registered transition path must not duplicate fallback Space changes.
             if (gWindowServerTransitions ? type == 1401 : type != 1401) return;
             if (typed) {
@@ -507,6 +734,7 @@ static void windowServerSpaceChanged(uint32_t type, void *data, size_t length, v
             int64_t delay = (gWindowServerTransitions ? 100 : 50) * NSEC_PER_MSEC;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{
                 @autoreleasepool {
+                    if (generation != atomic_load(&gSpaceEventsGeneration)) return;
                     gSpaceChangePending = NO;
                     if (gWindowServerSpaceEvents) recordSpaceChange(gWindowServerTransitions);
                 }
@@ -523,12 +751,29 @@ static void pumpWindowServerEvents(CFMachPortRef port, void *message, CFIndex si
     }
 }
 
+static void stopWindowServerSpaceEvents(void) {
+    if (atomic_load(&gSpaceEventsGeneration) & 1) atomic_fetch_add(&gSpaceEventsGeneration, 1);
+    gWindowServerSpaceEvents = gWindowServerTransitions = gSpaceChangePending = NO;
+    for (NSNumber *type in gSpaceNotificationTypes)
+        gRemoveConnectionNotify(gWindowServerConnection, windowServerSpaceChanged, type.unsignedIntValue, NULL);
+    gSpaceNotificationTypes = nil;
+    if (gSpaceSource) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), gSpaceSource, kCFRunLoopCommonModes);
+        CFRelease(gSpaceSource);
+        gSpaceSource = NULL;
+    }
+    if (gSpacePort) { CFRelease(gSpacePort); gSpacePort = NULL; }
+    gFullscreenSpaces = nil;
+}
+
 static BOOL appKitSpaceEventsFallback(NSString *reason) {
+    stopWindowServerSpaceEvents();
     os_log_info(agentLog(), "space events: appkit fallback (%{public}@)", reason);
     return NO;
 }
 
 static BOOL startWindowServerSpaceEvents(void) {
+    if (!gReopenInFullScreen || !gTrusted) return NO;
     // Keep the images loaded for the lifetime of the function pointers and registered callback.
     void *skyLight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW | RTLD_LOCAL);
     if (!skyLight) return appKitSpaceEventsFallback([NSString stringWithFormat:@"SkyLight load failed: %s", dlerror()]);
@@ -549,6 +794,9 @@ static BOOL startWindowServerSpaceEvents(void) {
     void (*setPortOptions)(CFMachPortRef, int) = symbols[4];
     gWindowServerConnection = mainConnection();
     if (gWindowServerConnection <= 0) return appKitSpaceEventsFallback(@"SLSMainConnectionID returned no connection");
+    gRemoveConnectionNotify = dlsym(skyLight, "SLSRemoveConnectionNotifyProc");
+    if (!gRemoveConnectionNotify) return appKitSpaceEventsFallback(@"missing symbol SLSRemoveConnectionNotifyProc");
+    gSpaceNotificationTypes = [NSMutableSet set];
     gSpaceGetType = dlsym(skyLight, "SLSSpaceGetType");
     BOOL transitions = YES;
     const uint32_t transitionTypes[] = { 1327, 1328 };
@@ -560,11 +808,16 @@ static BOOL startWindowServerSpaceEvents(void) {
             transitions = NO;
             break;
         }
+        [gSpaceNotificationTypes addObject:@(transitionTypes[i])];
     }
     if (!transitions) {
+        for (NSNumber *type in gSpaceNotificationTypes)
+            gRemoveConnectionNotify(gWindowServerConnection, windowServerSpaceChanged, type.unsignedIntValue, NULL);
+        [gSpaceNotificationTypes removeAllObjects];
         error = registerNotify(gWindowServerConnection, windowServerSpaceChanged, 1401, NULL);
         if (error != kCGErrorSuccess)
             return appKitSpaceEventsFallback([NSString stringWithFormat:@"SLSRegisterConnectionNotifyProc failed: %d", error]);
+        [gSpaceNotificationTypes addObject:@1401];
     }
     mach_port_t eventPort = MACH_PORT_NULL;
     error = getEventPort(gWindowServerConnection, &eventPort);
@@ -580,9 +833,10 @@ static BOOL startWindowServerSpaceEvents(void) {
     }
     gWindowServerTransitions = transitions;
     gWindowServerSpaceEvents = YES;
+    atomic_fetch_add(&gSpaceEventsGeneration, 1);
+    gSpaceSource = source;
+    gSpacePort = port;
     CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
-    CFRelease(source);
-    CFRelease(port);
     if (gTrusted) seedFullscreenSpaces(skyLight);
     os_log_info(agentLog(), "space events: windowserver %{public}s", transitions ? "transitions" : "space changes");
     return YES;
@@ -712,7 +966,7 @@ static void windowChanged(AXObserverRef observer, AXUIElementRef element, CFStri
 }
 
 static void startRestore(NSRunningApplication *app) {
-    if (!gTrusted || !eligible(app) || remembered(app.bundleIdentifier) != StateFullscreen) return;
+    if (!gReopenInFullScreen || !gTrusted || !eligible(app) || remembered(app.bundleIdentifier) != StateFullscreen) return;
     RestorePolicy policy = restorePolicy(remembered(app.bundleIdentifier), YES, now());
     NSNumber *pid = @(app.processIdentifier);
     RestoreSession *previous = gRestores[pid];
@@ -751,8 +1005,83 @@ static void startRestore(NSRunningApplication *app) {
     attemptRestore(session);
 }
 
+static void stopReopen(void) {
+    gReopenRunning = NO;
+    gReopenGeneration++;
+    stopWindowServerSpaceEvents();
+    NSNotificationCenter *center = NSWorkspace.sharedWorkspace.notificationCenter;
+    for (id token in @[gLaunchObserver ?: NSNull.null, gSpaceObserver ?: NSNull.null,
+                       gActivationObserver ?: NSNull.null, gTerminationObserver ?: NSNull.null])
+        if (token != NSNull.null) [center removeObserver:token];
+    gLaunchObserver = gSpaceObserver = gActivationObserver = gTerminationObserver = nil;
+    for (RestoreSession *session in gRestores.allValues) [session stop];
+    [gRestores removeAllObjects];
+    for (SpaceSeries *series in gSpaceChecks.allValues) [series stop];
+    [gSpaceChecks removeAllObjects];
+    [gLastSpaceChanges removeAllObjects];
+    [gProtected removeAllObjects];
+    gPreviousSpacePID = 0;
+}
+
+static void updateReopen(void) {
+    if (!gReopenInFullScreen || !gTrusted) { stopReopen(); return; }
+    if (gReopenRunning) return;
+    gReopenRunning = YES;
+    uint64_t generation = ++gReopenGeneration;
+    gPreviousSpacePID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    BOOL appKitSpaceEvents = !startWindowServerSpaceEvents();
+    if (appKitSpaceEvents && !gAppKitEventPump) {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+        gAppKitEventPump = YES;
+        if (gAgentRunLoopStarted) dispatch_async(dispatch_get_main_queue(), ^{ [NSApp run]; });
+    }
+    os_log_debug(agentLog(), "WindowServer connection is up");
+    AXUIElementRef system = AXUIElementCreateSystemWide();
+    AXUIElementSetMessagingTimeout(system, 0.25);
+    CFRelease(system);
+    NSNotificationCenter *workspace = NSWorkspace.sharedWorkspace.notificationCenter;
+    gLaunchObserver = [workspace addObserverForName:NSWorkspaceDidLaunchApplicationNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            if (!gReopenRunning || generation != gReopenGeneration) return;
+            @autoreleasepool { startRestore(note.userInfo[NSWorkspaceApplicationKey]); }
+        }];
+    if (appKitSpaceEvents) gSpaceObserver = [workspace addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification
+        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            (void)note;
+            if (!gReopenRunning || generation != gReopenGeneration) return;
+            static BOOL receivedSpaceChange;
+            if (!receivedSpaceChange) {
+                receivedSpaceChange = YES;
+                os_log_debug(agentLog(), "first Space change received");
+            }
+            @autoreleasepool { spaceChanged(); }
+        }];
+    // Existing windowed apps are not evidence of a deliberate full-screen exit.
+    for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) recordApplication(app, YES, "startup");
+}
+
+static void publishSpaceEventsPath(void) {
+    NSString *path = gReopenRunning ? (gWindowServerSpaceEvents ?
+        (gWindowServerTransitions ? @"windowserver transitions" : @"windowserver space changes") : @"appkit fallback") : nil;
+    CFPreferencesSetAppValue(CFSTR("SpaceEventsPath"), (__bridge CFStringRef)path, PREFS_DOMAIN);
+    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    [NSDistributedNotificationCenter.defaultCenter postNotificationName:StatusChanged object:nil userInfo:nil deliverImmediately:YES];
+}
+
+static void loadSettings(void) {
+    readSettings();
+    // Starting reopen can record apps, which reloads preferences before merging saved entries.
+    if (gApplyingSettings) return;
+    gApplyingSettings = YES;
+    updateReopen();
+    updateFnFTaps();
+    gApplyingSettings = NO;
+}
+
 static void settingsChanged(void) {
     loadSettings();
+    publishSpaceEventsPath();
     for (NSNumber *pid in gSpaceChecks.allKeys)
         if (ignored(gSpaceChecks[pid]->app.bundleIdentifier)) stopSpaceSeries(pid);
     for (RestoreSession *session in gRestores.allValues)
@@ -764,7 +1093,7 @@ static void settingsChanged(void) {
 #pragma mark - Status
 
 static int printStatus(void) {
-    loadSettings();
+    readSettings();
     __block NSDictionary *reply = nil;
     NSString *request = NSUUID.UUID.UUIDString;
     NSDistributedNotificationCenter *center = NSDistributedNotificationCenter.defaultCenter;
@@ -775,8 +1104,17 @@ static int printStatus(void) {
     double deadline = now() + 1;
     while (!reply && now() < deadline) CFRunLoopRunInMode(kCFRunLoopDefaultMode, MAX(0, deadline - now()), true);
     [center removeObserver:token];
-    BOOL trusted = reply ? [reply[@"accessibility"] boolValue] : AXIsProcessTrusted();
-    printf("Accessibility: %s\n", trusted ? "granted" : "not granted");
+    printf("Accessibility: %s\n", reply ? ([reply[@"accessibility"] boolValue] ? "granted" : "not granted")
+           : "unknown (agent not responding)");
+    printf("Reopen in full screen: %s\n", reply ? ([reply[@"reopenInFullScreen"] boolValue] ? "on" : "off")
+           : "unknown (agent not responding)");
+    if (reply) {
+        printf("Force fn-F: %s, fn watch %s, key tap %s\n", [reply[@"forceFnF"] boolValue] ? "on" : "off",
+               [reply[@"fnFWatch"] boolValue] ? "active" : "inactive",
+               [reply[@"fnFKeyTap"] boolValue] ? "active" : "inactive");
+    } else {
+        printf("Force fn-F: unknown, fn watch unknown, key tap unknown (agent not responding)\n");
+    }
     printf("Restore pending: %s\n", reply ? ([reply[@"pending"] boolValue] ? "yes" : "no") : "unknown (agent not responding)");
     printf("Remembered apps:\n");
     if (!gApplications.count) printf("  None\n");
@@ -812,12 +1150,12 @@ static void checkPermission(void) {
             if (task.terminationReason != NSTaskTerminationReasonExit) return;
             int status = task.terminationStatus;
             if ((status == 0 || status == 1) && (status == 0) != gTrusted)
-                dispatch_async(dispatch_get_main_queue(), ^{ exit(1); });
+                dispatch_async(dispatch_get_main_queue(), ^{ stopFnFTaps(); exit(1); });
         }
     });
 }
 
-// Remove our login item, as turning off "Enable FullscreenKeeper" does, so nothing is left in Login Items and launchd
+// Remove our login item, as turning off both features does, so nothing is left in Login Items and launchd
 // does not start another copy of FullscreenKeeper at the next login.
 static void unregisterLoginItem(void) {
     if (!dlopen("/System/Library/Frameworks/ServiceManagement.framework/ServiceManagement", RTLD_NOW)) return;
@@ -833,6 +1171,7 @@ static void unregisterLoginItem(void) {
 // moments: exit with an error so launchd starts the new agent. Otherwise the app is gone: remove the login item and
 // exit for good (a successful exit is not restarted).
 static void appMoved(void) {
+    stopFnFTaps();
     dispatch_source_cancel(gBundleWatch);
     for (int i = 0; i < 10; i++) {
         sleep(1);
@@ -894,61 +1233,38 @@ int main(int argc, char **argv) {
         gSpaceChecks = [NSMutableDictionary dictionary];
         gLastSpaceChanges = [NSMutableDictionary dictionary];
         gProtected = [NSMutableDictionary dictionary];
+        gReopenRunning = NO;
+        NSDistributedNotificationCenter *center = NSDistributedNotificationCenter.defaultCenter;
+        __block BOOL starting = YES;
+        [center addObserverForName:SettingsChanged object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            (void)note;
+            // Startup always reloads once more after all observers and feature resources are ready.
+            if (!starting) { @autoreleasepool { settingsChanged(); } }
+        }];
         loadSettings();
         watchAppBundle();
-        BOOL appKitSpaceEvents = NO;
-        if (gTrusted) {
-            appKitSpaceEvents = !startWindowServerSpaceEvents();
-            if (appKitSpaceEvents) {
-                [NSApplication sharedApplication];
-                [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-            }
-            os_log_debug(agentLog(), "WindowServer connection is up");
-            AXUIElementRef system = AXUIElementCreateSystemWide();
-            AXUIElementSetMessagingTimeout(system, 0.25);
-            CFRelease(system);
-            NSNotificationCenter *workspace = NSWorkspace.sharedWorkspace.notificationCenter;
-            [workspace addObserverForName:NSWorkspaceDidLaunchApplicationNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-                @autoreleasepool { startRestore(note.userInfo[NSWorkspaceApplicationKey]); }
-            }];
-            if (appKitSpaceEvents) [workspace addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-                (void)note;
-                static BOOL receivedSpaceChange;
-                if (!receivedSpaceChange) {
-                    receivedSpaceChange = YES;
-                    os_log_debug(agentLog(), "first Space change received");
-                }
-                @autoreleasepool { spaceChanged(); }
-            }];
-        }
-        NSString *spaceEventsPath = gWindowServerSpaceEvents ?
-            (gWindowServerTransitions ? @"windowserver transitions" : @"windowserver space changes") : @"appkit fallback";
-        CFPreferencesSetAppValue(CFSTR("SpaceEventsPath"), (__bridge CFStringRef)spaceEventsPath, PREFS_DOMAIN);
-        CFPreferencesAppSynchronize(PREFS_DOMAIN);
-        [NSDistributedNotificationCenter.defaultCenter postNotificationName:StatusChanged object:nil userInfo:nil deliverImmediately:YES];
-        NSDistributedNotificationCenter *center = NSDistributedNotificationCenter.defaultCenter;
         [center addObserverForName:@"com.apple.accessibility.api" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
             (void)note;
             checkPermission();
-        }];
-        [center addObserverForName:SettingsChanged object:nil queue:nil usingBlock:^(NSNotification *note) {
-            (void)note;
-            @autoreleasepool { settingsChanged(); }
         }];
         [center addObserverForName:StatusRequest object:nil queue:nil usingBlock:^(NSNotification *note) {
             @autoreleasepool {
                 if (![note.object isKindOfClass:[NSString class]]) return;
                 [NSDistributedNotificationCenter.defaultCenter postNotificationName:StatusReply object:note.object
-                                    userInfo:@{ @"pending": @(gRestores.count > 0), @"accessibility": @(gTrusted) }
+                                    userInfo:@{ @"pending": @(gRestores.count > 0), @"accessibility": @(gTrusted),
+                                                @"reopenInFullScreen": @(gReopenInFullScreen), @"forceFnF": @(gForceFnF),
+                                                @"fnFWatch": @(gFnFHID != NULL),
+                                                @"fnFKeyTap": @(gFnFKeyTap && CGEventTapIsEnabled(gFnFKeyTap)) }
                           deliverImmediately:YES];
             }
         }];
-        // Existing windowed apps at startup are not evidence of a deliberate full-screen exit.
-        if (gTrusted)
-            for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) recordApplication(app, YES, "startup");
-        // AppKit supplies the event pump only when the private WindowServer path is unavailable.
-        if (appKitSpaceEvents) [NSApp run];
+        starting = NO;
+        settingsChanged();
+        // AppKit supplies the event pump when the private WindowServer path is unavailable.
+        gAgentRunLoopStarted = YES;
+        if (gAppKitEventPump) [NSApp run];
         else CFRunLoopRun();
+        stopFnFTaps();
     }
     return 0;
 }

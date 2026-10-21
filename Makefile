@@ -1,6 +1,6 @@
 # FullscreenKeeper: `make` builds .build/FullscreenKeeper.app (hidden, so Spotlight does not list the build copy), `make install` copies it to /Applications and opens it.
 # `make dmg` builds the disk image; `make release` builds, notarizes and staples it (Developer ID required).
-VERSION  := 1.0.1
+VERSION  := 1.0.2
 BUILD    ?= .build
 APP      := $(BUILD)/FullscreenKeeper.app
 STAGE    := $(BUILD)/stage/FullscreenKeeper.app
@@ -45,7 +45,7 @@ signing-identity:
 $(APP): $(AGENT_SRC) $(POLICY_HEADER) $(APP_SRC) Resources/Info.plist Resources/$(AGENT_ID).plist Resources/$(UPDATER_ID).plist $(wildcard Resources/AppIcon.icns) | signing-identity
 	rm -rf $(STAGE)
 	mkdir -p $(BUILD)/module-cache $(CONTENTS)/MacOS $(CONTENTS)/Resources $(CONTENTS)/Library/LaunchAgents
-	clang $(CFLAGS) -framework Foundation -framework AppKit -framework ApplicationServices -framework Security $(AGENT_SRC) \
+	clang $(CFLAGS) -framework Foundation -framework AppKit -framework ApplicationServices -framework IOKit -framework Security $(AGENT_SRC) \
 		-o $(CONTENTS)/MacOS/fullscreenkeeperd
 	swiftc -O -warnings-as-errors -module-cache-path $(BUILD)/module-cache -swift-version 5 -parse-as-library -target $(ARCH)-apple-macos$(MIN_OS) \
 		$(APP_SRC) -o $(CONTENTS)/MacOS/FullscreenKeeper
@@ -61,7 +61,7 @@ updater-test-agent: $(BUILD)/fullscreenkeeperd-updater-test
 
 $(BUILD)/fullscreenkeeperd-updater-test: $(AGENT_SRC) $(POLICY_HEADER)
 	mkdir -p $(BUILD)
-	clang $(CFLAGS) -DUPDATER_TEST_FEED -framework Foundation -framework AppKit -framework ApplicationServices -framework Security $(AGENT_SRC) -o $@
+	clang $(CFLAGS) -DUPDATER_TEST_FEED -framework Foundation -framework AppKit -framework ApplicationServices -framework IOKit -framework Security $(AGENT_SRC) -o $@
 
 # scripts/install.sh replaces the app and keeps the background agent working across updates.
 install: $(APP)
@@ -106,7 +106,7 @@ $(BUILD)/policy-tests: Sources/Agent/Policy.c $(POLICY_HEADER) Tests/main.c
 
 $(BUILD)/agent-tests: $(AGENT_SRC) $(POLICY_HEADER) Tests/agent.m
 	mkdir -p $(BUILD)
-	clang $(CFLAGS) -framework Foundation -framework AppKit -framework ApplicationServices Tests/agent.m Sources/Agent/Policy.c Sources/Agent/Updater.m -framework Security -o $@
+	clang $(CFLAGS) -framework Foundation -framework AppKit -framework ApplicationServices -framework IOKit Tests/agent.m Sources/Agent/Policy.c Sources/Agent/Updater.m -framework Security -o $@
 
 # Updater policy checks use only private fixture folders and never call the network entry point.
 $(BUILD)/updater-tests: Sources/Agent/Updater.m Sources/Agent/Updater.h Tests/updater.m

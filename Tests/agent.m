@@ -2,6 +2,8 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <IOKit/hid/IOHIDManager.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 #include <os/log.h>
 #include <assert.h>
 #include <dlfcn.h>
@@ -9,6 +11,8 @@
 #include <math.h>
 
 static unsigned applicationCreations, activationPolicyChanges, applicationRuns, runLoopRuns;
+static dispatch_block_t agentRunHook, preferenceReadHook;
+static unsigned settingsObserverRegistrations;
 @interface TestAgentApplication : NSObject
 + (instancetype)sharedApplication;
 - (BOOL)setActivationPolicy:(NSApplicationActivationPolicy)policy;
@@ -29,6 +33,7 @@ static TestAgentApplication *testApp;
 - (void)run {
     assert(NSThread.isMainThread && activationPolicyChanges == 1);
     applicationRuns++;
+    if (agentRunHook) agentRunHook();
 }
 @end
 
@@ -63,6 +68,12 @@ static TestWorkspace *workspace;
 static TestDistributedCenter *distributedCenter;
 @implementation TestDistributedCenter
 + (instancetype)defaultCenter { return distributedCenter; }
+- (id<NSObject>)addObserverForName:(NSNotificationName)name object:(id)object queue:(NSOperationQueue *)queue
+                      usingBlock:(void (^)(NSNotification *))block {
+    if ([name isEqualToString:@"io.github.fratayaydn.fullscreenkeeper.SettingsChanged"])
+        settingsObserverRegistrations++;
+    return [super addObserverForName:name object:object queue:queue usingBlock:block];
+}
 - (void)postNotificationName:(NSString *)name object:(NSString *)object userInfo:(NSDictionary *)info deliverImmediately:(BOOL)immediately {
     (void)immediately;
     [self postNotificationName:name object:object userInfo:info];
@@ -97,6 +108,12 @@ static NSTaskTerminationReason childReason;
 
 static NSDictionary *preferences;
 static id ignoredPreferences;
+static id reopenPreference, forceFnFPreference;
+static unsigned tapCreations, tapInvalidations, tapSourceCreations, tapSourceRemovals;
+static unsigned keyTapEnableCalls;
+static unsigned failTapCreation, failTapSourceCreation;
+static BOOL keyTapEnabled, fullscreenUnwritable, lastWrittenFullscreen;
+typedef struct { unsigned keycode; CGEventFlags flags; BOOL autorepeat; pid_t pid; } TestKeyEvent;
 static unsigned axCalls, writes, saves, trustChecks;
 static NSString *spaceEventsPreference;
 static BOOL permission, fullscreen, nonstandard, minimized;
@@ -113,6 +130,8 @@ static CGError registrationError, eventPortError;
 static int connectionID;
 static uint32_t failedRegistrationType;
 static NSMutableArray<NSNumber *> *registeredTypes;
+static NSMutableSet<NSNumber *> *activeTypes;
+static unsigned unregistrations, removedSpaceSources;
 static unsigned libraryLoads, registrations, portRequests, portOptions, addedSources, eventReads, eventsToDrain;
 static void (*registeredNotify)(uint32_t, void *, size_t, void *, int);
 static CFMachPortCallBack portCallback;
@@ -149,8 +168,16 @@ static CGError testRegisterNotify(int cid, void (*callback)(uint32_t, void *, si
     [registeredTypes addObject:@(type)];
     registrations++;
     if (type == failedRegistrationType) return kCGErrorFailure;
-    if (registrationError == kCGErrorSuccess) registeredNotify = callback;
+    if (registrationError == kCGErrorSuccess) { registeredNotify = callback; [activeTypes addObject:@(type)]; }
     return registrationError;
+}
+static CGError testRemoveNotify(int cid, void (*callback)(uint32_t, void *, size_t, void *, int),
+                                uint32_t type, void *context) {
+    assert(cid == connectionID && callback == registeredNotify && !context);
+    assert([activeTypes containsObject:@(type)]);
+    [activeTypes removeObject:@(type)];
+    unregistrations++;
+    return kCGErrorSuccess;
 }
 static CGError testEventPort(int cid, mach_port_t *port) {
     assert(cid == connectionID);
@@ -183,6 +210,7 @@ static void *testDlsym(void *handle, const char *name) {
     if (missingSymbol && !strcmp(name, missingSymbol)) return NULL;
     if (!strcmp(name, "SLSMainConnectionID")) return (void *)testMainConnection;
     if (!strcmp(name, "SLSRegisterConnectionNotifyProc")) return (void *)testRegisterNotify;
+    if (!strcmp(name, "SLSRemoveConnectionNotifyProc")) return (void *)testRemoveNotify;
     if (!strcmp(name, "SLSGetEventPort")) return (void *)testEventPort;
     if (!strcmp(name, "SLEventCreateNextEvent")) return (void *)testNextEvent;
     if (!strcmp(name, "SLSSpaceGetType")) return (void *)testSpaceType;
@@ -197,13 +225,122 @@ static CFMachPortRef testMachPort(CFAllocatorRef allocator, mach_port_t port, CF
     return failMachPort ? NULL : (CFMachPortRef)CFRetain(CFSTR("port"));
 }
 static CFRunLoopSourceRef testPortSource(CFAllocatorRef allocator, CFMachPortRef port, CFIndex order) {
-    assert(!allocator && CFEqual(port, CFSTR("port")) && order == 0 && portOptions == 1);
+    if (CFEqual(port, CFSTR("fnFKeys"))) {
+        assert(!allocator && order == 0);
+        if (++tapSourceCreations == failTapSourceCreation) return NULL;
+        return (CFRunLoopSourceRef)CFRetain(CFSTR("fnFKeySource"));
+    }
+    assert(!allocator && CFEqual(port, CFSTR("port")) && order == 0 && portOptions >= 1);
     return failRunLoopSource ? NULL : (CFRunLoopSourceRef)CFRetain(CFSTR("source"));
 }
 static void testAddSource(CFRunLoopRef loop, CFRunLoopSourceRef source, CFRunLoopMode mode) {
+    if (CFEqual(source, CFSTR("fnFKeySource"))) {
+        assert(loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
+        return;
+    }
     assert(loop == CFRunLoopGetMain() && CFEqual(source, CFSTR("source")) && mode == kCFRunLoopCommonModes);
     addedSources++;
 }
+
+static CFMachPortRef testTapCreate(CGEventTapLocation location, CGEventTapPlacement placement, CGEventTapOptions options,
+                                  CGEventMask mask, CGEventTapCallBack callback, void *context) {
+    assert(location == kCGSessionEventTap && placement == kCGHeadInsertEventTap && options == kCGEventTapOptionDefault);
+    assert(callback && !context);
+    assert(mask == (CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)));
+    if (++tapCreations == failTapCreation) return NULL;
+    keyTapEnabled = YES;
+    return (CFMachPortRef)CFRetain(CFSTR("fnFKeys"));
+}
+static void testTapEnable(CFMachPortRef tap, bool enabled) {
+    assert(CFEqual(tap, CFSTR("fnFKeys")));
+    keyTapEnableCalls++;
+    keyTapEnabled = enabled;
+}
+static bool testTapIsEnabled(CFMachPortRef tap) {
+    assert(CFEqual(tap, CFSTR("fnFKeys")));
+    return keyTapEnabled;
+}
+static void testTapInvalidate(CFMachPortRef tap) {
+    assert(!testTapIsEnabled(tap));
+    tapInvalidations++;
+}
+static void testRemoveSource(CFRunLoopRef loop, CFRunLoopSourceRef source, CFRunLoopMode mode) {
+    assert(loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
+    if (CFEqual(source, CFSTR("source"))) { removedSpaceSources++; return; }
+    assert(CFEqual(source, CFSTR("fnFKeySource")));
+    tapSourceRemovals++;
+}
+static int64_t testEventInteger(CGEventRef event, CGEventField field) {
+    TestKeyEvent *key = (TestKeyEvent *)event;
+    if (field == kCGKeyboardEventKeycode) return key->keycode;
+    if (field == kCGKeyboardEventAutorepeat) return key->autorepeat;
+    assert(field == kCGEventTargetUnixProcessID);
+    return key->pid;
+}
+static CGEventFlags testEventFlags(CGEventRef event) { return ((TestKeyEvent *)event)->flags; }
+
+static BOOL inputPermission, failHIDCreation, failHIDOpen, hidFiltered, hidMatched, hidScheduled, hidOpen;
+static unsigned hidCreations, hidCloses, hidUnscheduled, inputChecks;
+static IOHIDValueCallback hidCallback;
+typedef struct { uint32_t page, usage; CFIndex input; } TestHIDValue;
+static IOHIDAccessType testInputAccess(IOHIDRequestType type) {
+    assert(type == kIOHIDRequestTypeListenEvent);
+    inputChecks++;
+    return inputPermission ? kIOHIDAccessTypeGranted : kIOHIDAccessTypeDenied;
+}
+static IOHIDManagerRef testHIDCreate(CFAllocatorRef allocator, IOOptionBits options) {
+    assert(allocator == kCFAllocatorDefault && options == kIOHIDOptionsTypeNone);
+    assert(inputPermission && !keyTapEnabled);
+    hidCreations++;
+    hidFiltered = hidMatched = NO;
+    return failHIDCreation ? NULL : (IOHIDManagerRef)CFRetain(CFSTR("fnHID"));
+}
+static void testHIDFilter(IOHIDManagerRef manager, CFArrayRef multiple) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && !hidScheduled && !hidOpen && !hidMatched);
+    NSArray *matches = (__bridge NSArray *)multiple;
+    assert(([matches isEqual:@[
+        @{ @kIOHIDElementUsagePageKey: @0xFF, @kIOHIDElementUsageKey: @3 },
+        @{ @kIOHIDElementUsagePageKey: @0xFF00, @kIOHIDElementUsageKey: @3 }
+    ]]));
+    hidFiltered = YES;
+}
+static void testHIDMatch(IOHIDManagerRef manager, CFDictionaryRef matching) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && hidFiltered && !hidScheduled && !hidOpen);
+    assert(([(__bridge NSDictionary *)matching isEqual:@{
+        @kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Keyboard)
+    }]));
+    hidMatched = YES;
+}
+static void testHIDCallback(IOHIDManagerRef manager, IOHIDValueCallback callback, void *context) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && hidFiltered && hidMatched && !context);
+    hidCallback = callback;
+}
+static void testHIDSchedule(IOHIDManagerRef manager, CFRunLoopRef loop, CFStringRef mode) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
+    assert(hidFiltered && hidMatched && hidCallback && !hidScheduled);
+    hidScheduled = YES;
+}
+static IOReturn testHIDOpen(IOHIDManagerRef manager, IOOptionBits options) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && options == kIOHIDOptionsTypeNone && hidScheduled);
+    hidOpen = !failHIDOpen;
+    return failHIDOpen ? kIOReturnError : kIOReturnSuccess;
+}
+static void testHIDUnschedule(IOHIDManagerRef manager, CFRunLoopRef loop, CFStringRef mode) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
+    assert(hidScheduled);
+    hidScheduled = NO;
+    hidUnscheduled++;
+}
+static IOReturn testHIDClose(IOHIDManagerRef manager, IOOptionBits options) {
+    assert(CFEqual(manager, CFSTR("fnHID")) && options == kIOHIDOptionsTypeNone && !hidScheduled);
+    hidOpen = NO;
+    hidCloses++;
+    return kIOReturnSuccess;
+}
+static IOHIDElementRef testHIDElement(IOHIDValueRef value) { return (IOHIDElementRef)value; }
+static uint32_t testHIDPage(IOHIDElementRef element) { return ((TestHIDValue *)element)->page; }
+static uint32_t testHIDUsage(IOHIDElementRef element) { return ((TestHIDValue *)element)->usage; }
+static CFIndex testHIDInput(IOHIDValueRef value) { return ((TestHIDValue *)value)->input; }
 
 static Boolean testTrusted(void) { trustChecks++; return permission; }
 static AXUIElementRef testCreateApplication(pid_t pid) {
@@ -213,7 +350,8 @@ static AXUIElementRef testCreateApplication(pid_t pid) {
 }
 static AXUIElementRef testCreateSystem(void) { return testCreateApplication(0); }
 static AXError testTimeout(AXUIElementRef element, float timeout) {
-    (void)element; (void)timeout;
+    (void)element;
+    assert(timeout == 0.25);
     axCalls++;
     return kAXErrorSuccess;
 }
@@ -241,14 +379,15 @@ static AXError testSettable(AXUIElementRef element, CFStringRef key, Boolean *wr
     (void)element; (void)key;
     axCalls++;
     if (terminateDuringSettable) workspace.frontmostApplication.terminated = YES;
-    *writable = true;
+    *writable = !fullscreenUnwritable;
     return kAXErrorSuccess;
 }
 static AXError testWrite(AXUIElementRef element, CFStringRef key, CFTypeRef value) {
-    (void)element; (void)key; (void)value;
+    (void)element; (void)key;
     assert(!workspace.frontmostApplication.terminated);
     axCalls++;
     writes++;
+    lastWrittenFullscreen = CFBooleanGetValue(value);
     return kAXErrorSuccess;
 }
 static AXError testObserver(pid_t pid, AXObserverCallback callback, AXObserverRef *observer) {
@@ -260,6 +399,17 @@ static AXError testObserver(pid_t pid, AXObserverCallback callback, AXObserverRe
 static Boolean testSynchronize(CFStringRef domain) { (void)domain; return true; }
 static CFPropertyListRef testCopyPreference(CFStringRef key, CFStringRef domain) {
     assert(CFEqual(domain, CFSTR("io.github.fratayaydn.fullscreenkeeper")));
+    if (CFEqual(key, CFSTR("ReopenInFullScreen")))
+        return reopenPreference ? CFRetain((__bridge CFTypeRef)reopenPreference) : NULL;
+    if (CFEqual(key, CFSTR("ForceFnF"))) {
+        CFPropertyListRef value = forceFnFPreference ? CFRetain((__bridge CFTypeRef)forceFnFPreference) : NULL;
+        if (preferenceReadHook) {
+            dispatch_block_t hook = preferenceReadHook;
+            preferenceReadHook = nil;
+            hook();
+        }
+        return value;
+    }
     assert(CFEqual(key, CFSTR("Applications")) || CFEqual(key, CFSTR("IgnoredApplications")));
     id value = CFEqual(key, CFSTR("IgnoredApplications")) ? ignoredPreferences : preferences;
     return value ? CFRetain((__bridge CFTypeRef)value) : NULL;
@@ -289,7 +439,7 @@ static void testLog(const char *format, ...) {
     [logs addObject:[[NSString alloc] initWithFormat:plain arguments:arguments]];
     va_end(arguments);
 }
-static void testRunLoop(void) { runLoopRuns++; }
+static void testRunLoop(void) { runLoopRuns++; if (agentRunHook) agentRunHook(); }
 static void testAsync(dispatch_queue_t queue, dispatch_block_t block) {
     if (deferMainQueue && queue == dispatch_get_main_queue()) [mainQueueBlocks addObject:block];
     else block();
@@ -324,6 +474,26 @@ static void testExit(int status) { restartStatus = status; }
 #define CFMachPortCreateWithPort testMachPort
 #define CFMachPortCreateRunLoopSource testPortSource
 #define CFRunLoopAddSource testAddSource
+#define CFRunLoopRemoveSource testRemoveSource
+#define CFMachPortInvalidate testTapInvalidate
+#define CGEventTapCreate testTapCreate
+#define CGEventTapEnable testTapEnable
+#define CGEventTapIsEnabled testTapIsEnabled
+#define CGEventGetIntegerValueField testEventInteger
+#define CGEventGetFlags testEventFlags
+#define IOHIDCheckAccess testInputAccess
+#define IOHIDManagerCreate testHIDCreate
+#define IOHIDManagerSetInputValueMatchingMultiple testHIDFilter
+#define IOHIDManagerSetDeviceMatching testHIDMatch
+#define IOHIDManagerRegisterInputValueCallback testHIDCallback
+#define IOHIDManagerScheduleWithRunLoop testHIDSchedule
+#define IOHIDManagerOpen testHIDOpen
+#define IOHIDManagerUnscheduleFromRunLoop testHIDUnschedule
+#define IOHIDManagerClose testHIDClose
+#define IOHIDValueGetElement testHIDElement
+#define IOHIDElementGetUsagePage testHIDPage
+#define IOHIDElementGetUsage testHIDUsage
+#define IOHIDValueGetIntegerValue testHIDInput
 #define exit testExit
 static BOOL debugLogging;
 #define os_log_type_enabled(log, type) ((void)(log), (void)(type), debugLogging)
@@ -347,7 +517,15 @@ static int testUpdaterRun(BOOL force, BOOL install) {
 #undef main
 #undef updaterRun
 
+static void fnInput(uint32_t page, CFIndex input) {
+    assert(hidCallback && hidOpen && hidFiltered);
+    TestHIDValue value = { page, 3, input };
+    hidCallback(NULL, kIOReturnSuccess, NULL, (IOHIDValueRef)&value);
+}
+
 static void reset(void) {
+    stopReopen();
+    stopFnFTaps();
     for (RestoreSession *session in gRestores.allValues) finishRestore(session, YES, "test reset");
     for (SpaceSeries *series in gSpaceChecks.allValues) [series stop];
     if (gTerminationObserver) [workspace.notificationCenter removeObserver:gTerminationObserver];
@@ -357,12 +535,29 @@ static void reset(void) {
     workspace.notificationCenter = [NSNotificationCenter new];
     workspace.runningApplications = @[];
     distributedCenter = [TestDistributedCenter new];
+    agentRunHook = preferenceReadHook = nil;
+    settingsObserverRegistrations = 0;
     gRestores = [NSMutableDictionary dictionary];
     gSpaceChecks = [NSMutableDictionary dictionary];
     gLastSpaceChanges = [NSMutableDictionary dictionary];
     gProtected = [NSMutableDictionary dictionary];
     gApplications = preferences = @{};
     gIgnoredApplications = ignoredPreferences = @{};
+    reopenPreference = forceFnFPreference = nil;
+    gReopenInFullScreen = YES;
+    // Direct policy seams below simulate an already started reopen feature.
+    gReopenRunning = YES;
+    gAppKitEventPump = gAgentRunLoopStarted = NO;
+    gApplyingSettings = NO;
+    gForceFnF = NO;
+    tapCreations = tapInvalidations = tapSourceCreations = tapSourceRemovals = 0;
+    keyTapEnableCalls = 0;
+    failTapCreation = failTapSourceCreation = 0;
+    keyTapEnabled = fullscreenUnwritable = lastWrittenFullscreen = NO;
+    inputPermission = gInputMonitoringGranted = YES;
+    failHIDCreation = failHIDOpen = hidFiltered = hidMatched = hidScheduled = hidOpen = NO;
+    hidCreations = hidCloses = hidUnscheduled = inputChecks = 0;
+    hidCallback = NULL;
     axCalls = writes = saves = trustChecks = 0;
     applicationCreations = activationPolicyChanges = 0;
     applicationRuns = runLoopRuns = 0;
@@ -389,10 +584,13 @@ static void reset(void) {
     connectionID = 42;
     failedRegistrationType = 0;
     registeredTypes = [NSMutableArray array];
+    activeTypes = [NSMutableSet set];
+    unregistrations = removedSpaceSources = 0;
     libraryLoads = registrations = portRequests = portOptions = addedSources = eventReads = eventsToDrain = 0;
     registeredNotify = NULL;
     portCallback = NULL;
     gWindowServerSpaceEvents = gWindowServerTransitions = gSpaceChangePending = NO;
+    atomic_store(&gSpaceEventsGeneration, 0);
     gNextWindowServerEvent = NULL;
     gWindowServerConnection = 0;
     gSpaceGetType = NULL;
@@ -418,6 +616,72 @@ static TestApplication *application(pid_t pid, BOOL saved) {
     if (saved) records[app.bundleIdentifier] = @{ @"name": app.localizedName, @"fullscreen": @YES };
     gApplications = preferences = records;
     return app;
+}
+
+static void reopenDefaults(void) {
+    reset();
+    loadSettings();
+    assert(gReopenInFullScreen && !gForceFnF && !saves);
+    reopenPreference = @NO;
+    loadSettings();
+    assert(!gReopenInFullScreen && !saves);
+    reopenPreference = @YES;
+    loadSettings();
+    assert(gReopenInFullScreen && !saves);
+    reopenPreference = @"invalid";
+    loadSettings();
+    assert(gReopenInFullScreen && !saves);
+}
+
+static void reopenOffAtStartup(void) {
+    for (unsigned privateAPI = 0; privateAPI < 2; privateAPI++) {
+        for (unsigned force = 0; force < 2; force++) {
+            reset();
+            privateAPIAvailable = privateAPI;
+            reopenPreference = @NO;
+            forceFnFPreference = @(force);
+            TestApplication *app = application(220, YES);
+            workspace.frontmostApplication = app;
+            workspace.runningApplications = @[app];
+            // Even obsolete or ignored entries must remain untouched while reopen is off.
+            preferences = @{ app.bundleIdentifier: preferences[app.bundleIdentifier],
+                             @"old.windowed": @{ @"fullscreen": @NO } };
+            ignoredPreferences = @{ app.bundleIdentifier: @{} };
+            NSDictionary *before = preferences;
+            fullscreen = YES;
+            char *arguments[] = { "fullscreenkeeperd", NULL };
+            assert(agentMain(1, arguments) == 0);
+            assert(!gReopenInFullScreen && !gReopenRunning && !gWindowServerSpaceEvents);
+            assert(!libraryLoads && !registrations && !managedDisplayReads && !addedSources);
+            assert(!applicationCreations && !applicationRuns && runLoopRuns == 1);
+            assert(!gLaunchObserver && !gSpaceObserver && !gActivationObserver && !gTerminationObserver);
+            assert(!spaceEventsPreference && !axCalls && !writes && !saves);
+            assert([preferences isEqual:before] && tapCreations == force);
+            [workspace.notificationCenter postNotificationName:NSWorkspaceDidLaunchApplicationNotification object:nil
+                                                     userInfo:@{ NSWorkspaceApplicationKey: app }];
+            [workspace.notificationCenter postNotificationName:NSWorkspaceActiveSpaceDidChangeNotification object:nil];
+            recordApplication(app, YES, "startup");
+            recordSpaceChange(YES);
+            recordFullscreenSpace(1327, 1, app);
+            saveState(app, StateWindowed);
+            startRestore(app);
+            assert(!startWindowServerSpaceEvents());
+            settingsChanged();
+            assert(!axCalls && !writes && !saves && !registrations && !libraryLoads);
+            assert(!gRestores.count && !gSpaceChecks.count && !delayedBlocks.count);
+            assert([preferences isEqual:before]);
+            // Force fn-F still toggles ignored apps while remembering is off.
+            settingsChanged();
+            if (force) {
+                fnInput(0xFF, 1);
+                TestKeyEvent key = { kVK_ANSI_F, kCGEventFlagMaskSecondaryFn, NO, app.processIdentifier };
+                NSUInteger logCount = logs.count;
+                assert(!fnFKeyEvent(NULL, kCGEventKeyDown, (CGEventRef)&key, NULL));
+                assert(writes == 1 && !lastWrittenFullscreen && !saves && logs.count == logCount);
+                assert([preferences isEqual:before] && !registrations && !gRestores.count);
+            }
+        }
+    }
 }
 
 static void legacySettingsCleanup(void) {
@@ -524,6 +788,131 @@ static void startupObservers(void) {
         assert(!gSpaceChecks.count && !gTerminationObserver);
         if (!trusted) assert(axCalls == 0);
         assert(trustChecks == 1);
+    }
+}
+
+static NSDictionary *requestAgentStatus(void) {
+    __block NSDictionary *reply;
+    NSString *request = NSUUID.UUID.UUIDString;
+    id token = [distributedCenter addObserverForName:StatusReply object:request queue:nil
+        usingBlock:^(NSNotification *note) { reply = note.userInfo; }];
+    [distributedCenter postNotificationName:StatusRequest object:request userInfo:nil deliverImmediately:YES];
+    [distributedCenter removeObserver:token];
+    assert(reply);
+    return reply;
+}
+
+static NSString *statusOutput(NSDictionary *reply) {
+    id token = [distributedCenter addObserverForName:StatusRequest object:nil queue:nil
+        usingBlock:^(NSNotification *note) {
+            if (reply) [distributedCenter postNotificationName:StatusReply object:note.object
+                userInfo:reply deliverImmediately:YES];
+        }];
+    fflush(stdout);
+    int descriptors[2];
+    assert(pipe(descriptors) == 0);
+    int saved = dup(STDOUT_FILENO);
+    assert(saved >= 0 && dup2(descriptors[1], STDOUT_FILENO) >= 0);
+    close(descriptors[1]);
+    char *arguments[] = { "fullscreenkeeperd", "--status", NULL };
+    assert(agentMain(2, arguments) == 0);
+    fflush(stdout);
+    assert(dup2(saved, STDOUT_FILENO) >= 0);
+    close(saved);
+    char buffer[4096];
+    ssize_t length = read(descriptors[0], buffer, sizeof(buffer));
+    close(descriptors[0]);
+    [distributedCenter removeObserver:token];
+    assert(length > 0 && length < (ssize_t)sizeof(buffer));
+    return [[NSString alloc] initWithBytes:buffer length:(NSUInteger)length encoding:NSUTF8StringEncoding];
+}
+
+static void statusUsesAgentReply(void) {
+    for (unsigned enabled = 0; enabled < 2; enabled++) {
+        reset();
+        reopenPreference = @(!enabled);
+        forceFnFPreference = @(!enabled);
+        permission = !enabled;
+        inputPermission = !enabled;
+        NSString *output = statusOutput(@{ @"accessibility": @(enabled), @"reopenInFullScreen": @(enabled),
+            @"forceFnF": @(enabled), @"fnFWatch": @(enabled), @"fnFKeyTap": @(!enabled), @"pending": @(enabled) });
+        assert([output containsString:enabled ? @"Accessibility: granted\n" : @"Accessibility: not granted\n"]);
+        assert([output containsString:enabled ? @"Reopen in full screen: on\n" : @"Reopen in full screen: off\n"]);
+        assert([output containsString:enabled ? @"Force fn-F: on, fn watch active, key tap inactive\n"
+            : @"Force fn-F: off, fn watch inactive, key tap active\n"]);
+        assert(!trustChecks && !inputChecks);
+    }
+    reset();
+    NSString *output = statusOutput(nil);
+    assert([output containsString:@"Accessibility: unknown (agent not responding)\n"]);
+    assert([output containsString:@"Reopen in full screen: unknown (agent not responding)\n"]);
+    assert([output containsString:@"Force fn-F: unknown, fn watch unknown, key tap unknown (agent not responding)\n"]);
+    assert(!trustChecks && !inputChecks);
+
+    reset();
+    forceFnFPreference = @YES;
+    failHIDOpen = YES;
+    __block unsigned replies = 0;
+    agentRunHook = ^{
+        replies++;
+        NSDictionary *reply = requestAgentStatus();
+        assert([reply[@"accessibility"] boolValue] && [reply[@"forceFnF"] boolValue]);
+        assert(![reply[@"fnFWatch"] boolValue] && ![reply[@"fnFKeyTap"] boolValue]);
+    };
+    char *arguments[] = { "fullscreenkeeperd", NULL };
+    assert(agentMain(1, arguments) == 0 && replies == 1);
+}
+
+static void settingsDuringStartup(void) {
+    for (unsigned privateAPI = 0; privateAPI < 2; privateAPI++) {
+        for (unsigned force = 0; force < 2; force++) {
+            for (unsigned reopen = 0; reopen < 2; reopen++) {
+                reset();
+                privateAPIAvailable = privateAPI;
+                reopenPreference = @YES;
+                forceFnFPreference = @(!force);
+                __block unsigned notifications = 0, runs = 0;
+                preferenceReadHook = ^{
+                    // The first read has captured the old fn-F value. Deliver the change before startup finishes.
+                    assert(settingsObserverRegistrations == 1);
+                    assert(!gReopenRunning && !gFnFHID && !gFnFKeyTap);
+                    reopenPreference = @(reopen);
+                    forceFnFPreference = @(force);
+                    [distributedCenter postNotificationName:SettingsChanged object:nil userInfo:nil deliverImmediately:YES];
+                    notifications++;
+                    // Applying is deferred until startup has initialized the feature resources.
+                    assert(!gReopenRunning && !gFnFHID && !gFnFKeyTap);
+                };
+                agentRunHook = ^{
+                    runs++;
+                    assert(notifications == 1 && !preferenceReadHook);
+                    assert(gReopenInFullScreen == reopen && gReopenRunning == reopen && gForceFnF == force);
+                    assert((gFnFHID != NULL) == force && (gFnFKeyTap != NULL) == force);
+                    assert(hidOpen == force && !keyTapEnabled);
+                    unsigned creations = tapCreations, spaceRegistrations = registrations;
+                    loadSettings();
+                    loadSettings();
+                    assert(tapCreations == creations && registrations == spaceRegistrations);
+                    NSDictionary *reply = requestAgentStatus();
+                    assert([reply[@"accessibility"] boolValue] == gTrusted);
+                    assert([reply[@"reopenInFullScreen"] boolValue] == reopen);
+                    assert([reply[@"forceFnF"] boolValue] == force);
+                    assert([reply[@"fnFWatch"] boolValue] == force && ![reply[@"fnFKeyTap"] boolValue]);
+                    if (force) {
+                        // Live state wins over both preferences and the stored enable intent.
+                        forceFnFPreference = @NO;
+                        keyTapEnabled = YES;
+                        reply = requestAgentStatus();
+                        assert([reply[@"fnFWatch"] boolValue] && [reply[@"fnFKeyTap"] boolValue]);
+                        keyTapEnabled = NO;
+                        forceFnFPreference = @YES;
+                    }
+                };
+                char *arguments[] = { "fullscreenkeeperd", NULL };
+                assert(agentMain(1, arguments) == 0 && runs == 1);
+                assert(!gFnFHID && !gFnFKeyTap);
+            }
+        }
     }
 }
 
@@ -845,7 +1234,8 @@ static void windowServerFallbacks(void) {
         @"missing symbol SLSGetEventPort", @"missing symbol SLEventCreateNextEvent",
         @"missing symbol _CFMachPortSetOptions", @"SLSMainConnectionID returned no connection",
         @"SLSRegisterConnectionNotifyProc failed", @"SLSGetEventPort failed", @"SLSGetEventPort failed",
-        @"CFMachPortCreateWithPort failed", @"CFMachPortCreateRunLoopSource failed"];
+        @"CFMachPortCreateWithPort failed", @"CFMachPortCreateRunLoopSource failed",
+        @"missing symbol SLSRemoveConnectionNotifyProc"];
     for (NSUInteger failure = 0; failure < reasons.count; failure++) {
         reset();
         privateAPIAvailable = failure != 0;
@@ -857,9 +1247,10 @@ static void windowServerFallbacks(void) {
         if (failure == 10) nullEventPort = YES;
         if (failure == 11) failMachPort = YES;
         if (failure == 12) failRunLoopSource = YES;
+        if (failure == 13) missingSymbol = "SLSRemoveConnectionNotifyProc";
         char *arguments[] = { "fullscreenkeeperd", NULL };
         assert(agentMain(1, arguments) == 0);
-        assert(!gWindowServerSpaceEvents && !addedSources && !managedDisplayReads);
+        assert(!gWindowServerSpaceEvents && !addedSources && !managedDisplayReads && !activeTypes.count);
         assert(applicationCreations == 1 && activationPolicyChanges == 1 && applicationRuns == 1 && !runLoopRuns);
         assert(matchingLogs(@"space events: appkit fallback").count == 1 && matchingLogs(reasons[failure]).count == 1);
         assert([spaceEventsPreference isEqual:@"appkit fallback"]);
@@ -1260,6 +1651,111 @@ static void windowServerBursts(void) {
     }
 }
 
+static void independentFeatureChanges(void) {
+    for (unsigned path = 0; path < 4; path++) {
+        reset();
+        privateAPIAvailable = path != 3;
+        if (path == 1) missingSymbol = "SLSSpaceGetType";
+        if (path == 2) failedRegistrationType = 1328;
+        TestApplication *saved = application(230, YES);
+        TestApplication *other = application(231, NO);
+        workspace.runningApplications = @[saved, other];
+        workspace.frontmostApplication = saved;
+        forceFnFPreference = @YES;
+        char *arguments[] = { "fullscreenkeeperd", NULL };
+        assert(agentMain(1, arguments) == 0);
+        settingsChanged();  // The test run loop returns, so reattach its shortcut taps.
+        IOHIDManagerRef hid = gFnFHID;
+        CFMachPortRef keyTap = gFnFKeyTap;
+        unsigned creations = tapCreations;
+        assert(gReopenRunning && gLaunchObserver && hid && keyTap);
+        assert((gSpaceObserver != nil) == (path == 3));
+        assert((gSpaceSource != NULL) == (path < 3));
+        NSDictionary *before = preferences;
+        startRestore(saved);
+        RestoreSession *session = gRestores[@230];
+        assert(session && session->readBack && writes == 1);
+        NSMutableArray<dispatch_block_t> *stale = [session->checks mutableCopy];
+        [stale addObject:session->expiry];
+        [stale addObject:session->readBack];
+        workspace.frontmostApplication = other;
+        windowsError = kAXErrorCannotComplete;
+        recordSpaceChange(YES);
+        SpaceSeries *series = gSpaceChecks[@231];
+        assert(series && gActivationObserver && gTerminationObserver);
+        [stale addObjectsFromArray:series->checks];
+        dispatch_block_t queued = nil, coalesced = nil;
+        if (path < 3) {
+            deferMainQueue = YES;
+            notifySpace(path == 2 ? 1401 : 1327, 990);
+            queued = mainQueueBlocks.lastObject;
+            if (path > 0) { queued(); coalesced = delayedBlocks.lastObject; }
+            deferMainQueue = NO;
+        }
+        unsigned queries = axCalls, previousWrites = writes;
+        reopenPreference = @NO;
+        [distributedCenter postNotificationName:SettingsChanged object:nil];
+        assert(!gReopenRunning && !gLaunchObserver && !gSpaceObserver && !gActivationObserver && !gTerminationObserver);
+        assert(!gRestores.count && !gSpaceChecks.count && !gProtected.count && !gFullscreenSpaces.count);
+        assert(!gSpaceSource && !gSpacePort && !activeTypes.count && !gWindowServerSpaceEvents && !gSpaceChangePending);
+        assert(gFnFHID == hid && gFnFKeyTap == keyTap && tapCreations == creations);
+        assert(!spaceEventsPreference && [preferences isEqual:before] && !saves);
+        for (dispatch_block_t check in stale) { assert(dispatch_block_testcancel(check)); check(); }
+        if (queued) queued();
+        if (coalesced) coalesced();
+        windowChanged(NULL, NULL, NULL, (__bridge void *)session);
+        [workspace.notificationCenter postNotificationName:NSWorkspaceDidLaunchApplicationNotification object:nil
+                                                 userInfo:@{ NSWorkspaceApplicationKey: saved }];
+        [workspace.notificationCenter postNotificationName:NSWorkspaceActiveSpaceDidChangeNotification object:nil];
+        assert(axCalls == queries && writes == previousWrites && !saves && !gRestores.count);
+        assert(!session->element && !session->target && !series->checks);
+        assert(removedSpaceSources == (path < 3 ? 1u : 0u));
+        assert(unregistrations == (path == 0 || path == 1 ? 2u : path == 2 ? 2u : 0u));
+
+        reopenPreference = @YES;
+        windowsError = kAXErrorSuccess;
+        [distributedCenter postNotificationName:SettingsChanged object:nil];
+        assert(gReopenRunning && gLaunchObserver && (gSpaceObserver != nil) == (path == 3));
+        assert(activeTypes.count == (path < 2 ? 2u : path == 2 ? 1u : 0u));
+        assert(gFnFHID == hid && gFnFKeyTap == keyTap && tapCreations == creations);
+        queries = axCalls;
+        if (queued) queued();
+        if (coalesced) coalesced();
+        for (dispatch_block_t check in stale) check();
+        assert(axCalls == queries && writes == previousWrites && !saves && !gFullscreenSpaces.count);
+        assert(!gRestores.count && [preferences isEqual:before]);
+        id launch = gLaunchObserver, spaceObserver = gSpaceObserver;
+        CFRunLoopSourceRef source = gSpaceSource;
+        unsigned registrationsBefore = registrations;
+        forceFnFPreference = @NO;
+        [distributedCenter postNotificationName:SettingsChanged object:nil];
+        assert(!gFnFHID && !gFnFKeyTap && !gFnFLaunchObserver && !gFnFTerminationObserver);
+        assert(gReopenRunning && gLaunchObserver == launch && gSpaceObserver == spaceObserver && gSpaceSource == source);
+        assert(registrations == registrationsBefore && axCalls == queries);
+        // Reopening still restores launches when the shortcut is off.
+        workspace.frontmostApplication = saved;
+        [workspace.notificationCenter postNotificationName:NSWorkspaceDidLaunchApplicationNotification object:nil
+                                                 userInfo:@{ NSWorkspaceApplicationKey: saved }];
+        assert(gRestores[@230] && writes == previousWrites + 1 && !saves);
+    }
+}
+
+static void lateReopenFallback(void) {
+    reset();
+    reopenPreference = @NO;
+    char *arguments[] = { "fullscreenkeeperd", NULL };
+    assert(agentMain(1, arguments) == 0 && !applicationCreations && runLoopRuns == 1);
+    reopenPreference = @YES;
+    [distributedCenter postNotificationName:SettingsChanged object:nil];
+    assert(gReopenRunning && gSpaceObserver && applicationCreations == 1 && applicationRuns == 1);
+    reopenPreference = @NO;
+    [distributedCenter postNotificationName:SettingsChanged object:nil];
+    assert(!gSpaceObserver && !gLaunchObserver);
+    reopenPreference = @YES;
+    [distributedCenter postNotificationName:SettingsChanged object:nil];
+    assert(gSpaceObserver && applicationCreations == 1 && applicationRuns == 1);
+}
+
 static void windowDiagnostics(void) {
     reset();
     TestApplication *app = application(119, YES);
@@ -1494,10 +1990,11 @@ static void ignoredSettingsCleanup(void) {
 }
 
 static void ignoredEventPaths(void) {
-    // Typed transitions, missing-type transitions, 1401 and AppKit delivery all skip ignored apps.
+    // Space handling never remembers or restores ignored apps. Force fn-F still toggles them.
     for (unsigned path = 0; path < 4; path++) {
         reset();
         privateAPIAvailable = path != 3;
+        forceFnFPreference = @YES;
         if (path == 1) missingSymbol = "SLSSpaceGetType";
         if (path == 2) failedRegistrationType = 1327;
         TestApplication *app = application(202, YES);
@@ -1529,6 +2026,29 @@ static void ignoredEventPaths(void) {
         }
         assert(axCalls == before && writes == 0 && saves == 1 && !preferences.count);
         assert(!gRestores.count && !gSpaceChecks.count && !gActivationObserver && !gTerminationObserver);
+        settingsChanged();  // The test run loop returns, so reattach its shortcut taps.
+        fnInput(0xFF, 1);
+        TestKeyEvent key = { kVK_ANSI_F, kCGEventFlagMaskSecondaryFn, NO, app.processIdentifier };
+        for (unsigned exiting = 0; exiting < 2; exiting++) {
+            fullscreen = exiting != 0;
+            NSUInteger logCount = logs.count;
+            assert(!fnFKeyEvent(NULL, kCGEventKeyDown, (CGEventRef)&key, NULL));
+            assert(!fnFKeyEvent(NULL, kCGEventKeyUp, (CGEventRef)&key, NULL));
+            assert(writes == exiting + 1 && lastWrittenFullscreen == !exiting && logs.count == logCount);
+            unsigned afterToggle = axCalls;
+            fullscreen = !exiting;
+            if (path < 2) notifySpace(exiting ? 1328 : 1327, 901);
+            else if (path == 2) {
+                registeredNotify(1401, NULL, 0, NULL, connectionID);
+                delayedBlocks.lastObject();
+            } else {
+                [workspace.notificationCenter postNotificationName:NSWorkspaceActiveSpaceDidChangeNotification
+                                                          object:nil];
+            }
+            startRestore(app);
+            assert(axCalls == afterToggle && writes == exiting + 1 && saves == 1 && !preferences.count);
+            assert(!gRestores.count && !gSpaceChecks.count && !gFullscreenSpaces.count);
+        }
     }
 }
 
@@ -1581,7 +2101,7 @@ static void ignoringCancelsPendingWork(void) {
 }
 
 static void ignoredSpaceOwners(void) {
-    // Owners tracked before an ignore, and ignored owners enumerated at startup, must never be read on exit.
+    // Space exits must not remember or restore ignored owners. Force fn-F still works in them.
     for (unsigned startup = 0; startup < 2; startup++) {
         reset();
         privateAPIAvailable = YES;
@@ -1610,6 +2130,239 @@ static void ignoredSpaceOwners(void) {
     }
 }
 
+static void fnFTapLifecycle(void) {
+    reset();
+    reopenPreference = @NO;
+    settingsChanged();
+    assert(!gForceFnF && !hidCreations && !tapCreations && !gFnFHID && !gFnFKeyTap);
+    forceFnFPreference = @YES;
+    gTrusted = NO;
+    settingsChanged();
+    assert(gForceFnF && !hidCreations && !tapCreations && !gFnFHID && !gFnFKeyTap);
+    gTrusted = YES;
+    inputPermission = NO;
+    settingsChanged();
+    assert(!gInputMonitoringGranted && !hidCreations && !tapCreations && !gFnFHID && !gFnFKeyTap);
+    inputPermission = YES;
+    settingsChanged();
+    assert(tapCreations == 1 && hidCreations == 1 && hidOpen && !keyTapEnabled && tapSourceCreations == 1);
+    assert(gFnFLaunchObserver && gFnFTerminationObserver && !axCalls);
+    settingsChanged();
+    assert(tapCreations == 1 && hidCreations == 1);
+    inputPermission = NO;
+    loadSettings();
+    assert(!gFnFHID && !gFnFKeyTap && hidCloses == 1 && hidUnscheduled == 1);
+    inputPermission = YES;
+    loadSettings();
+    forceFnFPreference = @NO;
+    loadSettings();
+    assert(!gFnFHID && !gFnFKeyTap && !gFnFLaunchObserver && !gFnFTerminationObserver);
+    assert(!hidOpen && !keyTapEnabled && tapInvalidations == 2 && tapSourceRemovals == 2);
+    forceFnFPreference = @YES;
+    loadSettings();
+    assert(tapCreations == 3);
+    childStatus = 1;
+    checkPermission();
+    assert(restartStatus == 1 && !gFnFHID && !gFnFKeyTap && tapInvalidations == 3);
+
+    for (unsigned failure = 1; failure <= 4; failure++) {
+        reset();
+        forceFnFPreference = @YES;
+        reopenPreference = @NO;
+        failTapCreation = failure == 1;
+        failTapSourceCreation = failure == 2;
+        failHIDCreation = failure == 3;
+        failHIDOpen = failure == 4;
+        settingsChanged();
+        assert(!gFnFHID && !gFnFKeyTap && !gFnFBundleIDs && !gFnFLaunchObserver);
+        assert(!hidOpen && !keyTapEnabled && tapInvalidations == (failure == 1 ? 0u : 1u));
+        unsigned creations = tapCreations;
+        failTapCreation = failTapSourceCreation = 0;
+        failHIDCreation = failHIDOpen = NO;
+        loadSettings();
+        assert(tapCreations == creations + 1 && gFnFHID && gFnFKeyTap);
+        loadSettings();
+        assert(tapCreations == creations + 1);
+    }
+}
+
+static TestApplication *startFnF(void) {
+    reset();
+    TestApplication *app = application(210, NO);
+    workspace.runningApplications = @[app];
+    workspace.frontmostApplication = app;
+    reopenPreference = @NO;
+    forceFnFPreference = @YES;
+    settingsChanged();
+    fnInput(0xFF, 1);
+    [logs removeAllObjects];
+    deferMainQueue = YES;
+    return app;
+}
+
+static void fnFKeyFlow(void) {
+    TestApplication *app = startFnF();
+    TestKeyEvent key = { kVK_LeftArrow, kCGEventFlagMaskSecondaryFn, NO, app.processIdentifier };
+    CGEventRef event = (CGEventRef)&key;
+    assert(keyTapEnabled);
+    assert(fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL) == event);
+    key.keycode = kVK_ANSI_F;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL) && gFnFSwallowedDown);
+    assert(mainQueueBlocks.count == 1 && !axCalls && !writes && !saves);
+    key.autorepeat = YES;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL) && mainQueueBlocks.count == 1);
+    key.flags |= kCGEventFlagMaskShift;
+    key.autorepeat = NO;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyUp, event, NULL) && !gFnFSwallowedDown);
+    assert(!axCalls && mainQueueBlocks.count == 1);
+    mainQueueBlocks.lastObject();
+    assert(writes == 1 && lastWrittenFullscreen && queriedPIDs.lastObject.intValue == app.processIdentifier && !saves);
+    key.flags = kCGEventFlagMaskSecondaryFn;
+    fullscreen = YES;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL));
+    assert(!fnFKeyEvent(NULL, kCGEventKeyUp, event, NULL));
+    mainQueueBlocks.lastObject();
+    assert(writes == 2 && !lastWrittenFullscreen && !saves);
+    fnInput(0xFF, 0);
+    assert(!keyTapEnabled && hidOpen && !gFnFSwallowedDown);
+    assert(!logs.count);
+}
+
+static void fnFTargetCache(void) {
+    TestApplication *app = startFnF();
+    TestKeyEvent key = { kVK_ANSI_F, kCGEventFlagMaskSecondaryFn, NO, 999 };
+    CGEventRef event = (CGEventRef)&key;
+    assert(fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL) == event);
+    TestApplication *self = application(211, NO);
+    self.bundleIdentifier = (__bridge NSString *)PREFS_DOMAIN;
+    [workspace.notificationCenter postNotificationName:NSWorkspaceDidLaunchApplicationNotification object:nil
+                                             userInfo:@{ NSWorkspaceApplicationKey: self }];
+    key.pid = self.processIdentifier;
+    assert(fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL) == event);
+    ignoredPreferences = @{ app.bundleIdentifier: @{ @"name": @"Test App" } };
+    settingsChanged();
+    key.pid = app.processIdentifier;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL));
+    assert(!fnFKeyEvent(NULL, kCGEventKeyUp, event, NULL));
+    assert(mainQueueBlocks.count == 1 && !axCalls && tapCreations == 1);
+    mainQueueBlocks.lastObject();
+    assert(writes == 1 && lastWrittenFullscreen && !saves && !logs.count);
+    unsigned before = axCalls;
+    TestApplication *launched = application(212, NO);
+    [workspace.notificationCenter postNotificationName:NSWorkspaceDidLaunchApplicationNotification object:nil
+                                             userInfo:@{ NSWorkspaceApplicationKey: launched }];
+    assert([gFnFBundleIDs[@212] isEqual:launched.bundleIdentifier]);
+    [workspace.notificationCenter postNotificationName:NSWorkspaceDidTerminateApplicationNotification object:nil
+                                             userInfo:@{ NSWorkspaceApplicationKey: launched }];
+    assert(!gFnFBundleIDs[@212]);
+    key.pid = 212;
+    assert(fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL) == event && axCalls == before);
+}
+
+static void fnFDisableNotifications(void) {
+    startFnF();
+    assert(keyTapEnableCalls == 2 && gFnFKeyTapEnabled && keyTapEnabled);
+    fnInput(0xFF, 1);
+    assert(keyTapEnableCalls == 2);
+    fnInput(0xFF, 0);
+    assert(!gFnFKeyTapEnabled && !keyTapEnabled && keyTapEnableCalls == 3);
+    fnInput(0xFF, 0);
+    for (unsigned i = 0; i < 10; i++) fnFKeyEvent(NULL, kCGEventTapDisabledByUserInput, NULL, NULL);
+    assert(keyTapEnableCalls == 3 && !gFnFKeyTapEnabled && !keyTapEnabled);
+    fnInput(0xFF00, 1);
+    keyTapEnabled = NO;
+    gFnFSwallowedDown = YES;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByUserInput, NULL, NULL);
+    assert(keyTapEnableCalls == 4 && !keyTapEnabled && gFnFSwallowedDown && gFnFKeyTapEnabled);
+    assert(!axCalls && !mainQueueBlocks.count && !logs.count);
+}
+
+static void fnFTimeoutRecovery(void) {
+    startFnF();
+    keyTapEnabled = NO;
+    gFnFSwallowedDown = YES;
+    double before = now();
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(keyTapEnabled && keyTapEnableCalls == 3 && gFnFKeyTapNextRecovery >= before + 1.0);
+    assert(gFnFSwallowedDown && gFnFKeyTapEnabled);
+    keyTapEnabled = NO;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(!keyTapEnabled && keyTapEnableCalls == 3);
+    gFnFKeyTapNextRecovery = now() - 1.0;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(keyTapEnabled && keyTapEnableCalls == 4);
+    gFnFSwallowedDown = NO;
+    fnInput(0xFF00, 0);
+    gFnFKeyTapNextRecovery = 0;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(!gFnFKeyTapEnabled && !keyTapEnabled && keyTapEnableCalls == 5);
+    fnInput(0xFF, 1);
+    keyTapEnabled = NO;
+    gForceFnF = NO;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    gForceFnF = YES;
+    gTrusted = NO;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    gTrusted = YES;
+    gInputMonitoringGranted = NO;
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(!keyTapEnabled && keyTapEnableCalls == 6);
+    stopFnFTaps();
+    assert(keyTapEnableCalls == 7 && !gFnFKeyTapNextRecovery);
+    fnFKeyEvent(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(keyTapEnableCalls == 7 && !axCalls && !mainQueueBlocks.count && !logs.count);
+}
+
+static void fnFReleaseOrder(void) {
+    TestApplication *app = startFnF();
+    TestKeyEvent key = { kVK_ANSI_F, kCGEventFlagMaskSecondaryFn, NO, app.processIdentifier };
+    CGEventRef event = (CGEventRef)&key;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL));
+    fnInput(0xFF, 0);
+    assert(keyTapEnabled && gFnFSwallowedDown && gFnFReleaseTimeout && delayedBlocks.count == 1);
+    assert(scheduledDelays.lastObject.doubleValue == 1.0);
+    dispatch_block_t timeout = delayedBlocks.lastObject;
+    fnInput(0xFF, 0);  // Duplicate values must not extend the timeout.
+    assert(delayedBlocks.count == 1);
+    key.flags = 0;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyUp, event, NULL));
+    assert(!keyTapEnabled && !gFnFSwallowedDown && !gFnFReleaseTimeout);
+    fnInput(0xFF00, 1);
+    timeout();  // A stale timeout must not disable a later fn press.
+    assert(keyTapEnabled);
+    key.flags = kCGEventFlagMaskSecondaryFn;
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL));
+    fnInput(0xFF00, 0);
+    delayedBlocks.lastObject();
+    assert(!keyTapEnabled && !gFnFSwallowedDown && !gFnFReleaseTimeout);
+    assert(fnFKeyEvent(NULL, kCGEventKeyUp, event, NULL) == event);
+    fnInput(0xFF, 1);
+    assert(!fnFKeyEvent(NULL, kCGEventKeyDown, event, NULL));
+    fnInput(0xFF, 0);
+    timeout = delayedBlocks.lastObject;
+    stopFnFTaps();
+    timeout();
+    assert(!gFnFHID && !keyTapEnabled && !gFnFSwallowedDown && !logs.count);
+}
+
+static void fnFDeferredToggle(void) {
+    for (unsigned outcome = 0; outcome < 6; outcome++) {
+        TestApplication *app = startFnF();
+        TestKeyEvent key = { kVK_ANSI_F, kCGEventFlagMaskSecondaryFn, NO, app.processIdentifier };
+        assert(!fnFKeyEvent(NULL, kCGEventKeyDown, (CGEventRef)&key, NULL) && !axCalls);
+        if (outcome == 0) fullscreenUnwritable = YES;
+        if (outcome == 1) fullscreenError = kAXErrorAttributeUnsupported;
+        if (outcome == 2) { forceFnFPreference = @NO; settingsChanged(); }
+        if (outcome == 3) gIgnoredApplications = @{ app.bundleIdentifier: @{} };
+        if (outcome == 4) app.terminated = YES;
+        if (outcome == 5) app.bundleIdentifier = @"test.reused.pid";
+        mainQueueBlocks.lastObject();
+        assert(writes == (outcome == 3 ? 1u : 0u) && !saves);
+        assert(!logs.count);
+        if (outcome >= 2 && outcome != 3) assert(!axCalls);
+    }
+}
+
 static void updaterCommands(void) {
     reset();
     updaterCalls = 0;
@@ -1627,11 +2380,15 @@ static void updaterCommands(void) {
 int main(void) {
     @autoreleasepool {
         updaterCommands();
+        reopenDefaults();
+        reopenOffAtStartup();
         legacySettingsCleanup();
         immediateExitRemovesEntry();
         startupKeepsEntries();
         failedRestoreKeepsEntry();
         startupObservers();
+        settingsDuringStartup();
+        statusUsesAgentReply();
         windowServerStartup();
         windowServerFallbacks();
         windowServerRegistrationFallbacks();
@@ -1641,6 +2398,8 @@ int main(void) {
         spaceTypeRecording();
         fullscreenSpaceExits();
         windowServerBursts();
+        independentFeatureChanges();
+        lateReopenFallback();
         spaceChangeQueries();
         twoAppsBothGetRead();
         quickExitThenQuit();
@@ -1658,6 +2417,13 @@ int main(void) {
         ignoredEventPaths();
         ignoringCancelsPendingWork();
         ignoredSpaceOwners();
+        fnFTapLifecycle();
+        fnFKeyFlow();
+        fnFTargetCache();
+        fnFDisableNotifications();
+        fnFTimeoutRecovery();
+        fnFReleaseOrder();
+        fnFDeferredToggle();
         puts("Passed agent checks: legacy settings cleanup, immediate exits remove entries, startup keeps entries, failed restores keep entries,");
         puts("cached trust, WindowServer startup without NSApplication, event draining and release, private API fallback failures, transition registration fallbacks and Space ID decoding,");
         puts("type 4 creation saves without AX, non-full-screen types ignored, event-time frontmost apps, per-Space ownership,");
@@ -1667,8 +2433,12 @@ int main(void) {
         puts("Space-change query filtering, different-app immediate-only reads, same-app bounded series reads, per-PID restarts, two apps both read, quick exit then quit,");
         puts("four-read timing and early stops, stale callback cancellation, window diagnostics, termination timing and observer lifetime,");
         puts("zero or no standard windows stay unknown, series eligibility, terminated recording, fallback, expiry, read-back and termination during AX calls,");
-        puts("ignored apps never record, restore or query AX across all event paths; ignoring removes remembered entries and cancels pending work.");
+        puts("ignored apps never record or restore; ignoring removes entries and cancels pending restore work.");
+        puts("Force fn-F still toggles ignored apps without recording them or logging key presses.");
+        puts("Reopen defaults on; disabled startup does no Space or restore work and preserves preferences; independent runtime changes cancel stale work across all four Space paths.");
         puts("Updater command dispatch bypasses window and permission work; all three compatibility paths are saved.");
+        puts("Force fn-F: permission gates, fn-only HID queues, creation failures, cached targets, deferred toggles, repeats, keyUp, release order, release timeout, tap recovery and cleanup.");
+        puts("Startup settings notifications reconcile both features after initialization; repeated preference reads are idempotent; status replies report live tap state; status output uses agent permissions and features or unknown.");
     }
     return 0;
 }

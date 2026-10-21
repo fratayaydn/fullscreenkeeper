@@ -1,5 +1,14 @@
 #include "Policy.h"
 
+FnFAction fnFAction(unsigned keycode, uint64_t flags, bool keyDown, bool autorepeat,
+                    bool unknownOrSelf, bool swallowedDown) {
+    if (keycode != 3) return FnFPass;  // kVK_ANSI_F
+    if (swallowedDown) return FnFSwallow;
+    if (!keyDown || autorepeat || unknownOrSelf || !(flags & FnFFunctionMask) ||
+        (flags & (FnFShiftMask | FnFControlMask | FnFOptionMask | FnFCommandMask))) return FnFPass;
+    return FnFToggle;
+}
+
 bool shouldQuerySpaceChange(int previousPID, int frontmostPID, WindowState saved) {
     return previousPID == frontmostPID || saved != StateFullscreen;
 }

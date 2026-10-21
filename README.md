@@ -14,13 +14,16 @@ you leave full screen before quitting, the app opens as a window next time, the 
 
 ## What it does
 
-- If you quit an app while one of its windows is in native full screen, FullscreenKeeper remembers it and puts the
-  window back into full screen when the app opens again.
+The two toggles work independently. Use either one on its own, or both together.
+
+- **Remember full screen** remembers apps you quit with a window in native full screen and puts them back
+  in full screen when you reopen them. It is on by default. Turning it off keeps the remembered list for later.
 - When you leave full screen and then quit, the app is forgotten and opens normally.
 - Apps that restore full screen on their own are left alone.
+- **Force fn-F** makes fn-F switch native full screen in apps that ignore the shortcut. It is off by default.
 - The window lists the apps that will reopen in full screen. Select one and click the minus button to forget it.
-- Apps you never want touched go in the Ignored Apps list. Use the plus button, or select an app in the top list
-  and click **Ignore**. FullscreenKeeper never reads or changes their windows.
+- Apps in the Ignored Apps list are never remembered or restored in full screen. Use the plus button, or select
+  an app in the top list and click **Ignore**. Force fn-F still works in ignored apps.
 - Updates itself from GitHub releases (see [Updates](#updates)).
 
 ## Resource use
@@ -30,19 +33,22 @@ that a full-screen Space was created or closed, or when an app opens. Switching 
 or windows doesn't wake it. Over two minutes idle it used 0.4 ms of CPU and had no wakeups. Entering or leaving
 full screen costs about 0.7 ms of CPU.
 
+With Force fn-F on, the agent only wakes when fn is pressed.
+
 Measured on macOS 26.7.1: memory with `footprint`, CPU and wakeups with the kernel's `proc_pid_rusage` counters.
 
 The update check is a separate process that runs once a day and after a restart, for about 0.3 seconds, and then
 exits. There is no menu bar icon, and the settings window only runs while it's open. The app is about 640 KB.
 
-## Accessibility permission
+## Permissions
 
 FullscreenKeeper needs Accessibility access to see whether a window is in full screen and to put it back. Click
 **Open Accessibility Settings...** in the window and allow **FullscreenKeeper** (it may show up as
 **fullscreenkeeperd**). Without it the agent does nothing.
 
-It only checks and sets the full-screen state of an app's windows; it doesn't read window titles, contents or
-keystrokes. All it stores is the name and bundle ID of each app in its two lists.
+It only checks and sets the full-screen state of an app's windows; it doesn't read window titles or contents.
+Force fn-F uses the same Accessibility permission and only watches the fn key, never other keys.
+All it stores is the name and bundle ID of each app in its two lists and your settings.
 
 ## Updates
 
@@ -61,6 +67,7 @@ unless you add `--greedy`.
 
 - The app has to support native full screen (the green button). Games and apps with their own full-screen mode may
   not work.
+- Force fn-F only works where the window supports native full screen, including in ignored apps.
 - Only full screen comes back, not window size, position or which display the window was on.
 - Split View: each app comes back in its own full screen, not side by side.
 - If an app takes more than about 15 seconds to show its window, FullscreenKeeper gives up for that launch and
@@ -89,14 +96,17 @@ Download `FullscreenKeeper-<version>.dmg` from the
 
 ### First run
 
-Open **FullscreenKeeper**, give it Accessibility access with the button in the window, and turn on **Enable
-FullscreenKeeper**. Close the window when you're done and FullscreenKeeper keeps working in the background.
+Open **FullscreenKeeper** and give it Accessibility access with the button in the window. **Remember full
+screen** is on by default. Turn on **Force fn-F** if you want the shortcut in apps that ignore it. Each toggle
+works on its own; turn both off to stop the background agent and its update job. Both app lists stay editable
+when **Remember full screen** is off. Close the window when you're done and the enabled features keep working
+in the background.
 
 ## How it works
 
 - `FullscreenKeeper.app/Contents/MacOS/fullscreenkeeperd` is a small background agent, registered as a login item
-  through `SMAppService`. It asks WindowServer to report when a full-screen Space is created or closed, and
-  otherwise sleeps.
+  through `SMAppService` when either feature is on. With reopening enabled, it asks WindowServer to report when a
+  full-screen Space is created or closed, and otherwise sleeps.
 - When a full-screen Space appears, it saves the app in front. When one closes and the app is still running as a
   window, you left full screen, so the app is forgotten. If the app quit instead, it stays remembered.
 - When a remembered app opens, it waits for its window and sets full screen through Accessibility. It never brings

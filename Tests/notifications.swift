@@ -1,5 +1,6 @@
 // Exercise notification behavior without requesting permission or posting to the system notification center.
 import AppKit
+import ServiceManagement
 import UserNotifications
 
 private let testError = NSError(domain: "NotificationTests", code: 7)
@@ -28,11 +29,85 @@ private final class NotificationFixture {
     }
 }
 
+private func featureSettings() throws {
+    let defaults = FeatureSettings(reopenValue: nil, forceFnFValue: nil)
+    precondition(defaults.reopenInFullScreen && !defaults.forceFnF && defaults.registersAgent)
+    let malformed = FeatureSettings(reopenValue: "invalid", forceFnFValue: "invalid")
+    precondition(malformed.reopenInFullScreen && !malformed.forceFnF)
+    let statuses: [SMAppService.Status] = [.notRegistered, .enabled, .requiresApproval]
+    for reopen in [false, true] {
+        for force in [false, true] {
+            let settings = FeatureSettings(reopenValue: reopen, forceFnFValue: force)
+            precondition(settings.reopenInFullScreen == reopen && settings.forceFnF == force)
+            precondition(settings.registersAgent == (reopen || force))
+            for agent in statuses {
+                for updater in statuses {
+                    var calls: [Bool] = []
+                    try reconcileLoginItems(settings, agentStatus: agent, updaterStatus: updater) { calls.append($0) }
+                    let shouldChange = settings.registersAgent
+                        ? agent == .notRegistered || updater == .notRegistered
+                        : agent != .notRegistered || updater != .notRegistered
+                    precondition(calls == (shouldChange ? [reopen || force] : []))
+                }
+            }
+            var requested = settings
+            requested.requestRegistration()
+            precondition(requested.registersAgent && requested.forceFnF == force)
+            precondition(requested.reopenInFullScreen == (reopen || !force))
+        }
+    }
+    do {
+        try reconcileLoginItems(defaults, agentStatus: .notRegistered, updaterStatus: .notRegistered) { _ in
+            throw testError
+        }
+        preconditionFailure("Expected registration error")
+    } catch {
+        precondition((error as NSError) == testError)
+    }
+    print("Passed feature settings checks: defaults, independent toggles, agent and updater registration, "
+        + "approval states, unchanged jobs, registration requests and errors.")
+}
+
+private func agentPermissions() throws {
+    var permissions = AgentPermissions()
+    var calls: [String] = []
+    let check: (String) -> Int32 = { calls.append($0); return 0 }
+    let restarted = try permissions.check(run: check)
+    precondition(restarted && permissions.accessibility && calls == ["--check"])
+    calls = []
+    let unchanged = try permissions.check(run: check)
+    precondition(!unchanged && calls == ["--check"])
+    let denied = try permissions.check { argument in
+        precondition(argument == "--check")
+        return 1
+    }
+    precondition(!denied && !permissions.accessibility)
+    let granted = try permissions.check { _ in 0 }
+    precondition(granted && permissions.accessibility)
+    do {
+        _ = try permissions.check { _ in 2 }
+        preconditionFailure("Expected invalid permission status")
+    } catch {
+        precondition((error as NSError).domain == "FullscreenKeeper.Permission")
+        precondition(permissions.accessibility)
+    }
+    do {
+        _ = try permissions.check { _ in throw testError }
+        preconditionFailure("Expected permission check failure")
+    } catch {
+        precondition((error as NSError) == testError && permissions.accessibility)
+    }
+    print("Passed agent permission checks: fresh Accessibility command, grant transitions restart once, "
+        + "revocation and errors.")
+}
+
 @main
 enum NotificationTests {
     @MainActor
     static func main() throws {
         precondition(NSApp == nil)
+        try featureSettings()
+        try agentPermissions()
         let installed = ["--notify-update", "1.2.3", "--installed"]
         let available = ["--notify-update", "1.2.3", "--available"]
         for version in ["", "v1.2.3", "1..2", ".1", "1.", "1.2.3.4", "-1", "1-beta", "1/2", "1. 2", "\u{0661}"] {

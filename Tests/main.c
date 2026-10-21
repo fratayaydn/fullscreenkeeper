@@ -168,6 +168,47 @@ static void unsupportedAndUnknown(void) {
     assert(policy.attempts == 0 && !policy.pending);
 }
 
+static void fnFModifiers(void) {
+    assert(fnFAction(3, FnFFunctionMask, true, false, false, false) == FnFToggle);
+    uint64_t modifiers[] = { FnFShiftMask, FnFCommandMask, FnFControlMask, FnFOptionMask };
+    for (unsigned i = 0; i < sizeof(modifiers) / sizeof(modifiers[0]); i++)
+        assert(fnFAction(3, FnFFunctionMask | modifiers[i], true, false, false, false) == FnFPass);
+    assert(fnFAction(3, 0, true, false, false, false) == FnFPass);
+}
+
+static void fnFExcludedTarget(void) {
+    assert(fnFAction(3, FnFFunctionMask, true, false, true, false) == FnFPass);
+    assert(fnFAction(3, FnFFunctionMask, false, false, true, false) == FnFPass);
+}
+
+static void fnFIgnoredTarget(void) {
+    // Ignored Apps only applies to remembering and restoring, so this is a known target.
+    assert(fnFAction(3, FnFFunctionMask, true, false, false, false) == FnFToggle);
+    assert(fnFAction(3, FnFFunctionMask, true, true, false, true) == FnFSwallow);
+    assert(fnFAction(3, FnFFunctionMask, false, false, false, true) == FnFSwallow);
+}
+
+static void fnFRepeats(void) {
+    assert(fnFAction(3, FnFFunctionMask, true, true, false, true) == FnFSwallow);
+    assert(fnFAction(3, FnFFunctionMask, true, false, false, true) == FnFSwallow);
+    assert(fnFAction(3, FnFFunctionMask, true, true, false, false) == FnFPass);
+    assert(fnFAction(3, FnFFunctionMask | FnFShiftMask, true, true, true, true) == FnFSwallow);
+}
+
+static void fnFKeyUp(void) {
+    assert(fnFAction(3, FnFFunctionMask, false, false, false, true) == FnFSwallow);
+    assert(fnFAction(3, 0, false, false, true, true) == FnFSwallow);
+    assert(fnFAction(3, FnFFunctionMask, false, false, false, false) == FnFPass);
+}
+
+static void fnFOtherKeys(void) {
+    for (unsigned keycode = 0; keycode < 128; keycode++) {
+        if (keycode == 3) continue;
+        assert(fnFAction(keycode, FnFFunctionMask, true, false, false, false) == FnFPass);
+        assert(fnFAction(keycode, FnFFunctionMask, false, false, false, true) == FnFPass);
+    }
+}
+
 int main(void) {
     switchingFullscreenApps();
     sameAppChangesSpace();
@@ -184,9 +225,17 @@ int main(void) {
     eventAfterLaunch();
     waitsPreserveAttempts();
     unsupportedAndUnknown();
-    puts("Passed 15 policy tests: full-screen app switches skip queries, same-app Space changes query, windowed or unknown apps query,");
+    fnFModifiers();
+    fnFExcludedTarget();
+    fnFIgnoredTarget();
+    fnFRepeats();
+    fnFKeyUp();
+    fnFOtherKeys();
+    puts("Passed 21 policy tests: full-screen app switches skip queries, same-app Space changes query,");
+    puts("windowed or unknown apps query,");
     puts("multiple windows, immediate exit, windowed launch, at most five writes,");
     puts("already full screen, startup, startup preserves memory, deadlines and read back, early read back, immediate launch event,");
-    puts("waits preserve attempts, unsupported windows and AX errors.");
+    puts("waits preserve attempts, unsupported windows and AX errors, fn-F modifiers, unknown and self targets,");
+    puts("ignored targets, repeats, keyUp and other keys.");
     return 0;
 }

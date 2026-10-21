@@ -101,6 +101,57 @@ let registeredBuildKey = "RegisteredBuildID"
 let currentBuildID = Bundle.main.object(forInfoDictionaryKey: "FKBuildID") as? String ?? ""
 let rememberedAppsType = UTType(exportedAs: "io.github.fratayaydn.fullscreenkeeper.remembered-apps", conformingTo: .data)
 
+struct FeatureSettings {
+    var reopenInFullScreen: Bool
+    var forceFnF: Bool
+
+    init(reopenValue: Any?, forceFnFValue: Any?) {
+        reopenInFullScreen = (reopenValue as? NSNumber)?.boolValue ?? true
+        forceFnF = (forceFnFValue as? NSNumber)?.boolValue ?? false
+    }
+
+    init(defaults: UserDefaults) {
+        self.init(reopenValue: defaults.object(forKey: "ReopenInFullScreen"),
+                  forceFnFValue: defaults.object(forKey: "ForceFnF"))
+    }
+
+    var registersAgent: Bool { reopenInFullScreen || forceFnF }
+
+    mutating func requestRegistration() {
+        if !registersAgent { reopenInFullScreen = true }
+    }
+}
+
+// Permission checks run in the agent executable so macOS uses the agent's identity and fresh process state.
+struct AgentPermissions {
+    var accessibility = false
+
+    mutating func check(run: (String) throws -> Int32) throws -> Bool {
+        func granted(_ argument: String, name: String) throws -> Bool {
+            let status = try run(argument)
+            guard status == 0 || status == 1 else {
+                throw NSError(domain: "FullscreenKeeper.Permission", code: Int(status),
+                              userInfo: [NSLocalizedDescriptionKey: "Could not check \(name) access (exit status \(status))."])
+            }
+            return status == 0
+        }
+        let newAccessibility = try granted("--check", name: "Accessibility")
+        let restart = !accessibility && newAccessibility
+        accessibility = newAccessibility
+        return restart
+    }
+}
+
+// Changing one feature must not re-register or restart an agent used by the other feature.
+func reconcileLoginItems(_ settings: FeatureSettings, agentStatus: SMAppService.Status,
+                         updaterStatus: SMAppService.Status, setEnabled: (Bool) throws -> Void) throws {
+    let statuses = [agentStatus, updaterStatus]
+    let registered = statuses.map { $0 == .enabled || $0 == .requiresApproval }
+    if settings.registersAgent ? registered.contains(false) : registered.contains(true) {
+        try setEnabled(settings.registersAgent)
+    }
+}
+
 struct RememberedApp: Identifiable {
     let id: String
     let name: String
@@ -121,11 +172,15 @@ struct RememberedApp: Identifiable {
 
 final class Model: ObservableObject {
     @Published var agentStatus = SMAppService.Status.notRegistered
-    @Published var accessibilityGranted = false
+    @Published private var permissions = AgentPermissions()
+    var accessibilityGranted: Bool { permissions.accessibility }
+    @Published private(set) var fnWatchActive: Bool?
     @Published var applications: [RememberedApp] = []
     @Published var ignoredApplications: [RememberedApp] = []
     @Published var errorMessage: String?
     @Published var automaticUpdates = true
+    @Published var reopenInFullScreen = true
+    @Published var forceFnF = false
     @Published var checkingUpdates = false
     @Published var latestVersion: String?
     @Published var lastUpdateCheck: Date?
@@ -136,10 +191,20 @@ final class Model: ObservableObject {
     private let agent = SMAppService.agent(plistName: agentPlistName)
     private var statusObserver: NSObjectProtocol?
     private var activeObserver: NSObjectProtocol?
+    private var statusReplyObserver: NSObjectProtocol?
+    private var statusRequestID = UUID().uuidString
 
     init() {
-        reregisterAfterUpdate()
+        statusReplyObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("io.github.fratayaydn.fullscreenkeeper.StatusReply"), object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, note.object as? String == self.statusRequestID else { return }
+            self.fnWatchActive = note.userInfo?["fnFWatch"] as? Bool
+        }
         refresh()
+        let wasEnabled = agentStatus == .enabled
+        updateFeatureRegistration()
+        reregisterAfterUpdate(wasEnabled: wasEnabled)
         checkPermissionAgain()
         statusObserver = DistributedNotificationCenter.default().addObserver(
             forName: statusChangedNotification, object: nil, queue: .main
@@ -155,11 +220,20 @@ final class Model: ObservableObject {
     deinit {
         if let statusObserver { DistributedNotificationCenter.default().removeObserver(statusObserver) }
         if let activeObserver { NotificationCenter.default.removeObserver(activeObserver) }
+        if let statusReplyObserver { DistributedNotificationCenter.default().removeObserver(statusReplyObserver) }
     }
 
     func refresh() {
+        fnWatchActive = nil
+        statusRequestID = UUID().uuidString
+        DistributedNotificationCenter.default().postNotificationName(
+            Notification.Name("io.github.fratayaydn.fullscreenkeeper.StatusRequest"),
+            object: statusRequestID, deliverImmediately: true)
         agentStatus = agent.status
         defaults.synchronize()
+        let features = FeatureSettings(defaults: defaults)
+        reopenInFullScreen = features.reopenInFullScreen
+        forceFnF = features.forceFnF
         automaticUpdates = defaults.object(forKey: "AutomaticallyInstallUpdates") == nil
             || defaults.bool(forKey: "AutomaticallyInstallUpdates")
         latestVersion = defaults.string(forKey: "LatestVersion")
@@ -168,7 +242,7 @@ final class Model: ObservableObject {
         let ignoredRecords = defaults.dictionary(forKey: "IgnoredApplications") as? [String: [String: Any]] ?? [:]
         let records = defaults.dictionary(forKey: "Applications") as? [String: [String: Any]] ?? [:]
         let fullscreenRecords = records.filter { $0.value["fullscreen"] as? Bool == true && ignoredRecords[$0.key] == nil }
-        if fullscreenRecords.count != records.count { saveApplications(fullscreenRecords) }
+        if reopenInFullScreen && fullscreenRecords.count != records.count { saveApplications(fullscreenRecords) }
         applications = fullscreenRecords.map { id, entry in
             RememberedApp(id: id, name: entry["name"] as? String ?? id)
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -276,15 +350,30 @@ final class Model: ObservableObject {
         DistributedNotificationCenter.default().postNotificationName(settingsChangedNotification, object: nil, deliverImmediately: true)
     }
 
-    var isEnabled: Bool { agentStatus == .enabled || agentStatus == .requiresApproval }
+    var isEnabled: Bool { reopenInFullScreen || forceFnF }
 
-    func setEnabled(_ on: Bool) {
+    private func updateFeatureRegistration() {
         do {
-            try setLoginItemsEnabled(on)
+            try reconcileLoginItems(FeatureSettings(defaults: defaults), agentStatus: agent.status,
+                                    updaterStatus: SMAppService.agent(plistName: updaterPlistName).status,
+                                    setEnabled: setLoginItemsEnabled)
         } catch {
-            errorMessage = "Could not \(on ? "enable" : "disable") FullscreenKeeper: \(error.localizedDescription)"
+            errorMessage = "Could not update FullscreenKeeper's background jobs: \(error.localizedDescription)"
         }
+        agentStatus = agent.status
+    }
+
+    private func setFeature(_ on: Bool, key: String) {
+        defaults.set(on, forKey: key)
+        defaults.synchronize()
+        // Let a running agent tear down the feature before unregistering the jobs if both are off.
+        DistributedNotificationCenter.default().postNotificationName(settingsChangedNotification, object: nil, deliverImmediately: true)
+        updateFeatureRegistration()
         refresh()
+    }
+
+    func setReopenInFullScreen(_ on: Bool) {
+        setFeature(on, key: "ReopenInFullScreen")
     }
 
     var availableVersion: String? {
@@ -311,6 +400,11 @@ final class Model: ObservableObject {
         defaults.set(on, forKey: "AutomaticallyInstallUpdates")
         defaults.synchronize()
         automaticUpdates = on
+    }
+
+    func setForceFnF(_ on: Bool) {
+        setFeature(on, key: "ForceFnF")
+        if on { checkPermissionAgain() }
     }
 
     func checkUpdates(install: Bool = false) {
@@ -351,22 +445,16 @@ final class Model: ObservableObject {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
-    // The agent has its own permission identity. A fresh process avoids cached trust state.
     func checkPermissionAgain() {
         do {
-            let status = try runAgentCommand("--check")
-            guard status == 0 || status == 1 else {
-                errorMessage = "Could not check Accessibility access (exit status \(status))."
-                return
-            }
-            let wasGranted = accessibilityGranted
-            accessibilityGranted = status == 0
+            let restart = try permissions.check(run: runAgentCommand)
             agentStatus = agent.status
-            if !wasGranted && accessibilityGranted && agentStatus == .enabled {
+            // Restart once when Accessibility becomes granted.
+            if restart && agentStatus == .enabled {
                 DispatchQueue.global().async { launchctl(["kickstart", "-k", agentJob]) }
             }
         } catch {
-            errorMessage = "Could not check Accessibility access: \(error.localizedDescription)"
+            errorMessage = "Could not check permissions: \(error.localizedDescription)"
         }
     }
 
@@ -382,10 +470,10 @@ final class Model: ObservableObject {
     }
 
     // Local signing pins launchd to a build, so refresh its launch constraint after an update.
-    private func reregisterAfterUpdate() {
+    private func reregisterAfterUpdate(wasEnabled: Bool) {
         guard defaults.string(forKey: registeredBuildKey) != currentBuildID else { return }
         defaults.set(currentBuildID, forKey: registeredBuildKey)
-        guard agent.status == .enabled else { return }
+        guard wasEnabled, FeatureSettings(defaults: defaults).registersAgent, agent.status == .enabled else { return }
         DispatchQueue.global().async { [weak self] in
             reregisterAgent()
             if !agentIsRunning() { reregisterAgent() }
@@ -396,93 +484,137 @@ final class Model: ObservableObject {
 
 // MARK: - Window
 
+// Use the grouped Form's native backdrop between its separate sections.
+private struct SettingsBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .windowBackground
+        view.blendingMode = .withinWindow
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
+}
+
 struct ContentView: View {
     @StateObject private var model = Model()
     @State private var selectedApps: Set<String> = []
     @State private var selectedIgnoredApps: Set<String> = []
 
     private var applicationListHeight: CGFloat {
-        // The inset list adds 10 points above and below its rows.
+        // Keep 10 points of padding outside the scrollable rows at each edge.
         CGFloat(min(max(model.applications.count, model.ignoredApplications.count, 4), 7)) * 24 + 20
     }
 
     var body: some View {
-        Form {
-            Section {
-                // Two texts in a Form row label: macOS shows the second one as the row's grey description.
-                Toggle(isOn: Binding(get: { model.isEnabled }, set: { model.setEnabled($0) })) {
-                    Text("Enable FullscreenKeeper")
-                    Text("Return to full screen when you reopen an app.")
-                }
-                statusRow
-                if let path = model.spaceEventsPath, path != "windowserver transitions" {
-                    StatusRow(symbol: "exclamationmark.triangle.fill", color: .yellow,
-                              title: "Running in compatibility mode.",
-                              detail: "A macOS update changed something FullscreenKeeper uses; it still works, an update will restore the lighter mode.")
-                }
-            }
-            Section {
-                HStack(alignment: .top, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Apps That Reopen in Full Screen")
-                            .font(.headline)
-                            .foregroundStyle(.secondary)
-                        ApplicationList(applications: model.applications, selection: $selectedApps,
-                                        height: applicationListHeight,
-                                        emptyMessage: "Quit an app in full screen to add it.",
-                                        ignore: { model.ignore(selectedApps) },
-                                        drag: { app in
-                                            let ids = selectedApps.contains(app.id) ? selectedApps : [app.id]
-                                            let provider = NSItemProvider()
-                                            provider.registerDataRepresentation(forTypeIdentifier: rememberedAppsType.identifier,
-                                                                                visibility: .ownProcess) { completion in
-                                                completion(try? JSONEncoder().encode(Array(ids)), nil)
-                                                return nil
-                                            }
-                                            return provider
-                                        }, removeLabel: "Forget selected apps") {
-                            model.forget(selectedApps)
-                            selectedApps.removeAll()
-                        }
+        VStack(spacing: 10) {
+            Form {
+                Section {
+                    // Two texts in a Form row label: macOS shows the second one as the row's grey description.
+                    Toggle(isOn: Binding(get: { model.reopenInFullScreen }, set: { model.setReopenInFullScreen($0) })) {
+                        Text("Remember full screen")
+                        Text("Opens an app in full screen again if you quit it in full screen.")
                     }
-                    .frame(maxWidth: .infinity)
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Ignored Apps")
-                            .font(.headline)
-                            .foregroundStyle(.secondary)
-                        ApplicationList(applications: model.ignoredApplications, selection: $selectedIgnoredApps,
-                                        height: applicationListHeight,
-                                        emptyMessage: "No ignored apps.", add: { model.chooseIgnoredApplications() },
-                                        drop: { model.ignoreDroppedApplications($0) },
-                                        removeLabel: "Remove selected ignored apps") {
-                            model.unignore(selectedIgnoredApps)
-                            selectedIgnoredApps.removeAll()
-                        }
+                    Toggle(isOn: Binding(get: { model.forceFnF }, set: { model.setForceFnF($0) })) {
+                        Text("Force fn-F")
+                        Text("Makes fn-F switch full screen in every app, even apps that ignore it.")
                     }
-                    .frame(maxWidth: .infinity)
+                    statusRow
+                    if model.forceFnF && model.accessibilityGranted && model.fnWatchActive == false {
+                        StatusRow(symbol: "exclamationmark.triangle.fill", color: .yellow,
+                                  title: "Force fn-F Is Not Available",
+                                  detail: "macOS did not allow FullscreenKeeper to watch the fn key on this Mac.")
+                    }
+                    if model.reopenInFullScreen, let path = model.spaceEventsPath, path != "windowserver transitions" {
+                        StatusRow(symbol: "exclamationmark.triangle.fill", color: .yellow,
+                                  title: "Running in compatibility mode.",
+                                  detail: "A macOS update changed something FullscreenKeeper uses; it still works, an update will restore the lighter mode.")
+                    }
                 }
             }
-            Section("Updates") {
-                Toggle(isOn: Binding(get: { model.automaticUpdates }, set: { model.setAutomaticUpdates($0) })) {
-                    Text("Install updates automatically")
-                    Text("Only updates signed by the developer and notarized by Apple.")
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
+            // The stack supplies the section gap instead of the Form's bottom margin.
+            .padding(.bottom, -20)
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Apps That Reopen in Full Screen")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    ApplicationList(applications: model.applications, selection: $selectedApps,
+                                    height: applicationListHeight,
+                                    emptyMessage: "Quit an app in full screen to add it.",
+                                    ignore: { model.ignore(selectedApps) },
+                                    drag: { app in
+                                        let ids = selectedApps.contains(app.id) ? selectedApps : [app.id]
+                                        let provider = NSItemProvider()
+                                        provider.registerDataRepresentation(forTypeIdentifier: rememberedAppsType.identifier,
+                                                                            visibility: .ownProcess) { completion in
+                                            completion(try? JSONEncoder().encode(Array(ids)), nil)
+                                            return nil
+                                        }
+                                        return provider
+                                    }, removeLabel: "Forget selected apps") {
+                        model.forget(selectedApps)
+                        selectedApps.removeAll()
+                    }
                 }
-                HStack {
-                    Text("Version \(model.version), \(model.lastCheckedText.lowercased().replacingOccurrences(of: "checked:", with: "checked"))")
-                        .lineLimit(1)
-                    Spacer()
-                    Button(model.checkingUpdates ? "Checking..." : "Check Now") { model.checkUpdates() }
-                        .disabled(model.checkingUpdates)
+                .frame(maxWidth: .infinity)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Ignored Apps")
+                        .help("Never remembered or restored in full screen. Force fn-F still works in these apps.")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    ApplicationList(applications: model.ignoredApplications, selection: $selectedIgnoredApps,
+                                    height: applicationListHeight,
+                                    emptyMessage: "No ignored apps.", add: { model.chooseIgnoredApplications() },
+                                    drop: { model.ignoreDroppedApplications($0) },
+                                    removeLabel: "Remove selected ignored apps") {
+                        model.unignore(selectedIgnoredApps)
+                        selectedIgnoredApps.removeAll()
+                    }
                 }
-                if !model.automaticUpdates, let version = model.availableVersion {
-                    Button("Install \(version)") { model.checkUpdates(install: true) }
-                        .disabled(model.checkingUpdates)
+                .frame(maxWidth: .infinity)
+            }
+            .padding(10)
+            .background {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.primary.opacity(0.02))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.primary.opacity(0.03), lineWidth: 1)
+            }
+            .padding(.horizontal, 20)
+
+            Form {
+                Section("Updates") {
+                    Toggle(isOn: Binding(get: { model.automaticUpdates }, set: { model.setAutomaticUpdates($0) })) {
+                        Text("Install updates automatically")
+                        Text("Only updates signed by the developer and notarized by Apple.")
+                    }
+                    HStack {
+                        Text("Version \(model.version), \(model.lastCheckedText.lowercased().replacingOccurrences(of: "checked:", with: "checked"))")
+                            .lineLimit(1)
+                        Spacer()
+                        Button(model.checkingUpdates ? "Checking..." : "Check Now") { model.checkUpdates() }
+                            .disabled(model.checkingUpdates)
+                    }
+                    if !model.automaticUpdates, let version = model.availableVersion {
+                        Button("Install \(version)") { model.checkUpdates(install: true) }
+                            .disabled(model.checkingUpdates)
+                    }
                 }
             }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
         }
-        .formStyle(.grouped)
+        .controlSize(.regular)
         .frame(width: 720)
-        .fixedSize(horizontal: false, vertical: true)
+        .background(SettingsBackground())
         .onChange(of: model.applications.map(\.id)) { ids in
             selectedApps.formIntersection(ids)
         }
@@ -497,21 +629,27 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var statusRow: some View {
-        switch model.agentStatus {
-        case .enabled where !model.accessibilityGranted:
+        if !model.isEnabled {
+            StatusRow(symbol: "circle", color: .secondary, title: "FullscreenKeeper Is Off",
+                      detail: "Apps use their own window restoration behavior.")
+        } else if !model.accessibilityGranted {
             StatusRow(symbol: "exclamationmark.triangle.fill", color: .yellow,
                       title: "Accessibility Required",
-                      detail: "FullscreenKeeper only checks and sets full screen. It doesn't read titles, contents or keystrokes. After allowing it, click Check Again.\n\nAlready in the list after an update? Remove it with the minus button and allow it again.",
+                      detail: "FullscreenKeeper checks and sets full screen. Force fn-F also checks keys while fn is held. It doesn't read titles or contents. After allowing it, click Check Again.\n\nAlready in the list after an update? Remove it with the minus button and allow it again.",
                       action: ("Open Accessibility Settings...", { model.openAccessibility() }),
                       secondaryAction: ("Check Again", { model.checkPermissionAgain() }))
-        case .enabled:
+        } else if model.agentStatus == .enabled {
             StatusRow(symbol: "checkmark.circle.fill", color: .green, title: "FullscreenKeeper Is On",
-                      detail: "Remembers full screen while this window is closed.")
-        case .requiresApproval:
+                      detail: model.reopenInFullScreen && model.forceFnF
+                          ? "Remembers full screen and makes fn-F work in every app."
+                          : model.reopenInFullScreen ? "Remembers full screen."
+                          : "Makes fn-F work in every app.",
+                      doubleCheck: model.reopenInFullScreen && model.forceFnF)
+        } else if model.agentStatus == .requiresApproval {
             StatusRow(symbol: "exclamationmark.triangle.fill", color: .yellow, title: "Approval Required",
                       detail: "Allow FullscreenKeeper under Allow in the Background so it can run without this window.",
                       action: ("Open Login Items...", { SMAppService.openSystemSettingsLoginItems() }))
-        default:
+        } else {
             StatusRow(symbol: "circle", color: .secondary, title: "FullscreenKeeper Is Off",
                       detail: "Apps use their own window restoration behavior.")
         }
@@ -542,8 +680,11 @@ struct ApplicationList: View {
                     }
                 }
                 .tag(app.id)
+                .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
             }
-            .listStyle(.inset)
+            .listStyle(.plain)
+            .padding(.vertical, 10)
+            .background(Color(nsColor: .controlBackgroundColor))
             .frame(height: height)
             .overlay {
                 if applications.isEmpty {
@@ -611,13 +752,25 @@ struct StatusRow: View {
     let detail: String
     var action: (label: String, run: () -> Void)? = nil
     var secondaryAction: (label: String, run: () -> Void)? = nil
+    /// The symbol twice, slightly overlapping: both features are on.
+    var doubleCheck = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: symbol)
-                .font(.system(size: 18))
-                .foregroundStyle(color)
-                .frame(width: 22)
+            Group {
+                if doubleCheck {
+                    HStack(spacing: -5) {
+                        Image(systemName: symbol)
+                        Image(systemName: symbol)
+                    }
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(color)
+                } else {
+                    Image(systemName: symbol).foregroundStyle(color)
+                }
+            }
+            .font(.system(size: 18))
+            .frame(width: 22)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).fontWeight(.medium)
                 Text(detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -679,6 +832,7 @@ func reregisterAgent() {
         for _ in 0..<70 where !launchctl(["print", job]).isEmpty { Thread.sleep(forTimeInterval: 0.5) }
     }
     Thread.sleep(forTimeInterval: 1)
+    guard FeatureSettings(defaults: .standard).registersAgent else { return }
     try? setLoginItemsEnabled(true)
     startAgentOnce()
     Thread.sleep(forTimeInterval: 2)
@@ -692,6 +846,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(0)
         }
         if CommandLine.arguments.contains("--register") {
+            let defaults = UserDefaults.standard
+            defaults.synchronize()
+            var settings = FeatureSettings(defaults: defaults)
+            settings.requestRegistration()
+            defaults.set(settings.reopenInFullScreen, forKey: "ReopenInFullScreen")
+            defaults.synchronize()
             do {
                 try setLoginItemsEnabled(true)
                 startAgentOnce()
