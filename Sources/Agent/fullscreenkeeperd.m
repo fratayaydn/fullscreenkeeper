@@ -11,7 +11,7 @@
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
-#include <os/log.h>
+#import "DiagnosticLog.h"
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include "Policy.h"
@@ -19,6 +19,7 @@
 
 #define PREFS_DOMAIN CFSTR("io.github.fratayaydn.fullscreenkeeper")
 #define KEY_APPLICATIONS CFSTR("Applications")
+#define KEY_SETTLE_APPLICATIONS CFSTR("SettleApplications")
 #define KEY_IGNORED_APPLICATIONS CFSTR("IgnoredApplications")
 #define KEY_REOPEN_IN_FULL_SCREEN CFSTR("ReopenInFullScreen")
 #define KEY_FORCE_FN_F CFSTR("ForceFnF")
@@ -28,6 +29,14 @@ static NSString *const SettingsChanged = @"io.github.fratayaydn.fullscreenkeeper
 static NSString *const StatusChanged = @"io.github.fratayaydn.fullscreenkeeper.StatusChanged";
 static NSString *const StatusRequest = @"io.github.fratayaydn.fullscreenkeeper.StatusRequest";
 static NSString *const StatusReply = @"io.github.fratayaydn.fullscreenkeeper.StatusReply";
+
+static BOOL builtInSettling(NSString *bundleID) {
+    // These apps show a temporary start window before their real window.
+    static NSString *const bundleIDs[] = { @"com.openai.codex" };
+    for (unsigned i = 0; i < sizeof(bundleIDs) / sizeof(bundleIDs[0]); i++)
+        if ([bundleIDs[i] isEqualToString:bundleID]) return YES;
+    return NO;
+}
 
 // ServiceManagement is loaded only when the app is removed.
 @interface NSObject (SMAppService)
@@ -45,6 +54,8 @@ static NSString *const StatusReply = @"io.github.fratayaydn.fullscreenkeeper.Sta
     NSMutableArray<dispatch_block_t> *checks;
     dispatch_block_t readBack;
     dispatch_block_t expiry;
+    dispatch_block_t settling;
+    NSArray *windows;
 }
 - (void)stop;
 @end
@@ -54,9 +65,12 @@ static NSString *const StatusReply = @"io.github.fratayaydn.fullscreenkeeper.Sta
     for (dispatch_block_t check in checks) dispatch_block_cancel(check);
     if (readBack) dispatch_block_cancel(readBack);
     if (expiry) dispatch_block_cancel(expiry);
+    if (settling) dispatch_block_cancel(settling);
     checks = nil;
     readBack = nil;
     expiry = nil;
+    settling = nil;
+    windows = nil;
     if (observer) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), kCFRunLoopCommonModes);
         CFRelease(observer);
@@ -85,6 +99,7 @@ static NSString *const StatusReply = @"io.github.fratayaydn.fullscreenkeeper.Sta
 @end
 
 static NSDictionary *gApplications;
+static NSDictionary *gSettleApplications;
 static NSDictionary *gIgnoredApplications;
 static NSMutableDictionary<NSNumber *, RestoreSession *> *gRestores;
 static NSMutableDictionary<NSNumber *, SpaceSeries *> *gSpaceChecks;
@@ -118,14 +133,8 @@ static dispatch_source_t gBundleWatch;
 static char gExecutable[PATH_MAX];
 static double now(void) { return NSProcessInfo.processInfo.systemUptime; }
 static void updateTerminationObserver(void);
+static void restoreChanged(RestoreSession *session, BOOL destroyed);
 static void loadSettings(void);
-
-static os_log_t agentLog(void) {
-    static os_log_t log;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ log = os_log_create("io.github.fratayaydn.fullscreenkeeper", "agent"); });
-    return log;
-}
 
 #pragma mark - Accessibility
 
@@ -352,6 +361,7 @@ static WindowState windowState(AXUIElementRef window, BOOL *standard, AXError *f
     return booleanAttribute(window, CFSTR("AXFullScreen"), failure);
 }
 
+#ifdef FULLSCREENKEEPER_DIAGNOSTIC_LOG
 static NSString *rawBoolean(id value, AXError error) {
     if (error != kAXErrorSuccess) return [NSString stringWithFormat:@"%d", error];
     if (!value || CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) return @"invalid";
@@ -365,7 +375,7 @@ static WindowState loggedWindowState(AXUIElementRef window, NSRunningApplication
     id subrole = attribute(window, kAXSubroleAttribute, &subroleError);
     id minimized = attribute(window, kAXMinimizedAttribute, &minimizedError);
     id fullscreen = attribute(window, CFSTR("AXFullScreen"), &fullscreenError);
-    os_log_debug(agentLog(), "%{public}s pid=%d window=%lu subrole=%{public}@ fullscreen=%{public}@ minimized=%{public}@",
+    DIAG(@"%s pid=%d window=%lu subrole=%@ fullscreen=%@ minimized=%@",
                 phase, app.processIdentifier, (unsigned long)index,
                 [subrole isKindOfClass:[NSString class]] ? subrole : [NSString stringWithFormat:@"%d", subroleError],
                 rawBoolean(fullscreen, fullscreenError), rawBoolean(minimized, minimizedError));
@@ -384,7 +394,10 @@ static WindowState loggedWindowState(AXUIElementRef window, NSRunningApplication
     return [fullscreen boolValue] ? StateFullscreen : StateWindowed;
 }
 
+#endif
+
 static WindowState applicationState(NSRunningApplication *app, const char *phase) {
+    (void)phase;
     if (!eligible(app)) return StateUnknown;
     AXError failure = kAXErrorSuccess;
     AXUIElementRef element = AXUIElementCreateApplication(app.processIdentifier);
@@ -393,25 +406,29 @@ static WindowState applicationState(NSRunningApplication *app, const char *phase
     BOOL found = [windows isKindOfClass:[NSArray class]];
     NSUInteger standardCount = 0;
     WindowState result = found ? StateWindowed : StateUnknown;
-    BOOL debug = os_log_type_enabled(agentLog(), OS_LOG_TYPE_DEBUG);
+    BOOL debug = DIAG_ENABLED;
     NSUInteger index = 0;
     for (id window in found ? windows : @[]) {
         NSUInteger windowIndex = index++;
         if (CFGetTypeID((__bridge CFTypeRef)window) != AXUIElementGetTypeID()) {
             if (debug && windowIndex < 4)
-                os_log_debug(agentLog(), "%{public}s pid=%d window=%lu invalid", phase, app.processIdentifier, (unsigned long)windowIndex);
+                DIAG(@"%s pid=%d window=%lu invalid", phase, app.processIdentifier, (unsigned long)windowIndex);
             result = combineWindows(result, StateUnknown);
             continue;
         }
         BOOL standard;
+#ifdef FULLSCREENKEEPER_DIAGNOSTIC_LOG
         WindowState state = debug && windowIndex < 4
             ? loggedWindowState((__bridge AXUIElementRef)window, app, phase, windowIndex, &standard, &failure)
             : windowState((__bridge AXUIElementRef)window, &standard, &failure);
+#else
+        WindowState state = windowState((__bridge AXUIElementRef)window, &standard, &failure);
+#endif
         result = combineWindows(result, state);
         if (standard) standardCount++;
     }
     if (!standardCount || app.terminated) result = StateUnknown;
-    os_log_debug(agentLog(), "%{public}s pid=%d bundle=%{public}@ windows=%ld standard=%lu fullscreen=%d state=%d ax=%d",
+    DIAG(@"%s pid=%d bundle=%@ windows=%ld standard=%lu fullscreen=%d state=%d ax=%d",
                 phase, app.processIdentifier, app.bundleIdentifier, found ? (long)[windows count] : -1L,
                 (unsigned long)standardCount, result == StateFullscreen, result, failure);
     return result;
@@ -439,15 +456,32 @@ static void readSettings(void) {
     gIgnoredApplications = [ignoredValue isKindOfClass:[NSDictionary class]] ? ignoredValue : @{};
     id value = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_APPLICATIONS, PREFS_DOMAIN));
     gApplications = [value isKindOfClass:[NSDictionary class]] ? value : @{};
-    if (!gReopenInFullScreen) return;
+    id settleValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_SETTLE_APPLICATIONS, PREFS_DOMAIN));
+    gSettleApplications = [settleValue isKindOfClass:[NSDictionary class]] ? settleValue : @{};
     NSMutableDictionary *records = [gApplications mutableCopy];
+    NSMutableDictionary *settleRecords = [gSettleApplications mutableCopy];
     for (NSString *bundleID in gApplications) {
         id entry = gApplications[bundleID];
+        if ([entry isKindOfClass:[NSDictionary class]] && entry[@"settle"]) {
+            id settle = entry[@"settle"];
+            if (!ignored(bundleID) && [settle isKindOfClass:[NSNumber class]] && [settle boolValue] &&
+                ![settleRecords[bundleID] isKindOfClass:[NSDictionary class]]) {
+                id name = entry[@"name"];
+                settleRecords[bundleID] = @{ @"name": [name isKindOfClass:[NSString class]] ? name : bundleID };
+            }
+            NSMutableDictionary *updated = [entry mutableCopy];
+            [updated removeObjectForKey:@"settle"];
+            records[bundleID] = updated;
+        }
         id fullscreen = [entry isKindOfClass:[NSDictionary class]] ? entry[@"fullscreen"] : nil;
-        if (ignored(bundleID) || ![fullscreen isKindOfClass:[NSNumber class]] || ![fullscreen boolValue])
+        if (gReopenInFullScreen && (ignored(bundleID) || ![fullscreen isKindOfClass:[NSNumber class]] || ![fullscreen boolValue]))
             [records removeObjectForKey:bundleID];
     }
-    if (records.count != gApplications.count) saveApplications(records);
+    if (![settleRecords isEqual:gSettleApplications]) {
+        gSettleApplications = settleRecords;
+        CFPreferencesSetAppValue(KEY_SETTLE_APPLICATIONS, (__bridge CFDictionaryRef)settleRecords, PREFS_DOMAIN);
+    }
+    if (![records isEqual:gApplications]) saveApplications(records);
 }
 
 static WindowState remembered(NSString *bundleID) {
@@ -468,20 +502,20 @@ static void saveState(NSRunningApplication *app, WindowState state) {
         [records removeObjectForKey:app.bundleIdentifier];
     if (app.terminated) return;
     saveApplications(records);
-    os_log_info(agentLog(), "%{public}s pid=%d bundle=%{public}@",
+    DIAG(@"%s pid=%d bundle=%@",
                 state == StateFullscreen ? "save" : "remove", app.processIdentifier, app.bundleIdentifier);
 }
 
 static WindowState recordApplication(NSRunningApplication *app, BOOL startup, const char *phase) {
     if (!gReopenInFullScreen) return StateUnknown;
     if (!gTrusted || !eligible(app)) {
-        os_log_debug(agentLog(), "%{public}s pid=%d bundle=%{public}@ skip", phase, app.processIdentifier, app.bundleIdentifier);
+        DIAG(@"%s pid=%d bundle=%@ skip", phase, app.processIdentifier, app.bundleIdentifier);
         return StateUnknown;
     }
     NSNumber *pid = @(app.processIdentifier);
     if (gProtected[pid].terminated) [gProtected removeObjectForKey:pid];
     if (gRestores[pid]) {
-        os_log_debug(agentLog(), "%{public}s pid=%d bundle=%{public}@ restoring", phase, app.processIdentifier, app.bundleIdentifier);
+        DIAG(@"%s pid=%d bundle=%@ restoring", phase, app.processIdentifier, app.bundleIdentifier);
         return StateUnknown;
     }
     WindowState observed = applicationState(app, phase);
@@ -515,8 +549,10 @@ static void updateTerminationObserver(void) {
                 if (!app) return;
                 NSNumber *pid = @(app.processIdentifier);
                 if (gSpaceChecks[pid] || remembered(app.bundleIdentifier) == StateFullscreen) {
+#ifdef FULLSCREENKEEPER_DIAGNOSTIC_LOG
                     NSNumber *lastSpace = gLastSpaceChanges[pid];
-                    os_log_debug(agentLog(), "terminate pid=%d bundle=%{public}@ series=%d saved=%d since-space=%.3f",
+#endif
+                    DIAG(@"terminate pid=%d bundle=%@ series=%d saved=%d since-space=%.3f",
                                 app.processIdentifier, app.bundleIdentifier, gSpaceChecks[pid] != nil,
                                 remembered(app.bundleIdentifier) == StateFullscreen,
                                 lastSpace ? now() - lastSpace.doubleValue : -1.0);
@@ -544,7 +580,7 @@ static void recordSpaceApplication(NSRunningApplication *app, BOOL seriesAllowed
             @autoreleasepool {
                 SpaceSeries *s = weakSeries;
                 if (!s || gSpaceChecks[pid] != s) return;
-                os_log_debug(agentLog(), "series pid=%d offset=%.2f since-space=%.3f",
+                DIAG(@"series pid=%d offset=%.2f since-space=%.3f",
                             s->app.processIdentifier, offset.doubleValue, now() - changedAt);
                 WindowState observed = recordApplication(s->app, NO, "series");
                 if (observed != StateUnknown || s->app.terminated || offset.doubleValue == 1.0) stopSpaceSeries(pid);
@@ -566,7 +602,7 @@ static void recordSpaceChange(BOOL transition) {
     BOOL query = transition || shouldQuerySpaceChange(gPreviousSpacePID, app.processIdentifier,
                                                      remembered(app.bundleIdentifier));
     gPreviousSpacePID = app.processIdentifier;
-    os_log_debug(agentLog(), "space pid=%d bundle=%{public}@ %{public}s",
+    DIAG(@"space pid=%d bundle=%@ %s",
                 app.processIdentifier, app.bundleIdentifier, query ? "query" : "skip");
     if (!query) return;
     recordSpaceApplication(app, seriesAllowed, changedAt);
@@ -661,7 +697,7 @@ static void seedFullscreenSpaces(void *skyLight) {
             }
         }
     }
-    os_log_debug(agentLog(), "fullscreen startup spaces=%lu", (unsigned long)found.count);
+    DIAG(@"fullscreen startup spaces=%lu", (unsigned long)found.count);
 }
 
 static void recordFullscreenSpace(uint32_t type, uint64_t sid, NSRunningApplication *frontmost) {
@@ -675,12 +711,12 @@ static void recordFullscreenSpace(uint32_t type, uint64_t sid, NSRunningApplicat
         space->pid = frontmost.processIdentifier;
         space->bundleID = [frontmost.bundleIdentifier copy];
         gFullscreenSpaces[key] = space;
-        os_log_debug(agentLog(), "fullscreen create sid=%llu pid=%d bundle=%{public}@",
+        DIAG(@"fullscreen create sid=%llu pid=%d bundle=%@",
                      (unsigned long long)sid, space->pid, space->bundleID);
         NSNumber *pid = @(space->pid);
         gLastSpaceChanges[pid] = @(now());
         stopSpaceSeries(pid);
-        if (gRestores[pid]) return;
+        if (gRestores[pid]) { restoreChanged(gRestores[pid], NO); return; }
         [gProtected removeObjectForKey:pid];
         saveState(frontmost, StateFullscreen);
         return;
@@ -688,8 +724,10 @@ static void recordFullscreenSpace(uint32_t type, uint64_t sid, NSRunningApplicat
     FullscreenSpace *space = gFullscreenSpaces[key];
     if (!space) return;
     [gFullscreenSpaces removeObjectForKey:key];
-    os_log_debug(agentLog(), "fullscreen destroy sid=%llu pid=%d bundle=%{public}@",
+    DIAG(@"fullscreen destroy sid=%llu pid=%d bundle=%@",
                  (unsigned long long)sid, space->pid, space->bundleID);
+    RestoreSession *session = gRestores[@(space->pid)];
+    if (session) restoreChanged(session, YES);
     if (space->app)
         for (FullscreenSpace *other in gFullscreenSpaces.allValues) {
             if (other->pid == space->pid && [other->bundleID isEqualToString:space->bundleID]) return;
@@ -717,7 +755,7 @@ static void windowServerSpaceChanged(uint32_t type, void *data, size_t length, v
             }
             frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
         } else {
-            os_log_debug(agentLog(), "windowserver event type=%u length=%zu", type, length);
+            DIAG(@"windowserver event type=%u length=%zu", type, length);
         }
         if (type != 1327 && type != 1328 && type != 1401) return;
         // Policy work stays on the main queue; never retain WindowServer's payload.
@@ -767,8 +805,9 @@ static void stopWindowServerSpaceEvents(void) {
 }
 
 static BOOL appKitSpaceEventsFallback(NSString *reason) {
+    (void)reason;
     stopWindowServerSpaceEvents();
-    os_log_info(agentLog(), "space events: appkit fallback (%{public}@)", reason);
+    DIAG(@"space events: appkit fallback (%@)", reason);
     return NO;
 }
 
@@ -804,7 +843,7 @@ static BOOL startWindowServerSpaceEvents(void) {
     for (size_t i = 0; i < sizeof(transitionTypes) / sizeof(transitionTypes[0]); i++) {
         error = registerNotify(gWindowServerConnection, windowServerSpaceChanged, transitionTypes[i], NULL);
         if (error != kCGErrorSuccess) {
-            os_log_info(agentLog(), "SLSRegisterConnectionNotifyProc type=%u failed: %d", transitionTypes[i], error);
+            DIAG(@"SLSRegisterConnectionNotifyProc type=%u failed: %d", transitionTypes[i], error);
             transitions = NO;
             break;
         }
@@ -838,7 +877,7 @@ static BOOL startWindowServerSpaceEvents(void) {
     gSpacePort = port;
     CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
     if (gTrusted) seedFullscreenSpaces(skyLight);
-    os_log_info(agentLog(), "space events: windowserver %{public}s", transitions ? "transitions" : "space changes");
+    DIAG(@"space events: windowserver %s", transitions ? "transitions" : "space changes");
     return YES;
 }
 
@@ -847,9 +886,10 @@ static BOOL startWindowServerSpaceEvents(void) {
 static void attemptRestore(RestoreSession *session);
 
 static void finishRestore(RestoreSession *session, BOOL succeeded, const char *reason) {
+    (void)reason;
     NSNumber *pid = @(session->app.processIdentifier);
     if (gRestores[pid] != session) return;
-    os_log_info(agentLog(), "restore finish pid=%d bundle=%{public}@ %{public}s attempts=%u",
+    DIAG(@"restore finish pid=%d bundle=%@ %s attempts=%u",
                 session->app.processIdentifier, session->app.bundleIdentifier,
                 session->app.terminated ? "terminated" : reason, session->policy.attempts);
     if (session->app.terminated) {
@@ -862,6 +902,90 @@ static void finishRestore(RestoreSession *session, BOOL succeeded, const char *r
         [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:gActivationObserver];
         gActivationObserver = nil;
     }
+}
+
+static void saveRestoreSettling(RestoreSession *session) {
+    readSettings();
+    NSString *bundleID = session->app.bundleIdentifier;
+    if (ignored(bundleID) || builtInSettling(bundleID) || [gSettleApplications[bundleID] isKindOfClass:[NSDictionary class]]) return;
+    NSMutableDictionary *records = [gSettleApplications mutableCopy];
+    records[bundleID] = @{ @"name": session->app.localizedName ?: bundleID };
+    gSettleApplications = records;
+    CFPreferencesSetAppValue(KEY_SETTLE_APPLICATIONS, (__bridge CFDictionaryRef)records, PREFS_DOMAIN);
+    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    DIAG(@"restore settle saved pid=%d bundle=%@", session->app.processIdentifier, bundleID);
+}
+
+static void scheduleRestoreSettling(RestoreSession *session, BOOL restarting) {
+    (void)restarting;
+    if (session->settling) dispatch_block_cancel(session->settling);
+    session->settling = nil;
+    if (session->policy.waitingForWindow) return;
+    DIAG(@"restore settling pid=%d %s", session->app.processIdentifier,
+                 restarting ? "restart" : "enter");
+    __weak RestoreSession *weakSession = session;
+    session->settling = dispatch_block_create(0, ^{
+        @autoreleasepool {
+            RestoreSession *s = weakSession;
+            if (!s || gRestores[@(s->app.processIdentifier)] != s) return;
+            s->settling = nil;
+            attemptRestore(s);
+        }
+    });
+    double delay = MAX(0, session->policy.nextAttempt - now());
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), session->settling);
+}
+
+static void restoreChanged(RestoreSession *session, BOOL destroyed) {
+    BOOL restarting = session->policy.settling;
+    if (!restoreWindowEvent(&session->policy, now(), destroyed)) return;
+    if (destroyed && session->policy.attempts) saveRestoreSettling(session);
+    if (session->readBack) dispatch_block_cancel(session->readBack);
+    session->readBack = nil;
+    if (session->target) { CFRelease(session->target); session->target = NULL; }
+    scheduleRestoreSettling(session, restarting);
+}
+
+static void observeRestoreWindows(RestoreSession *session) {
+    if (!session->observer) return;
+    id windows = attribute(session->element, kAXWindowsAttribute, NULL);
+    if (![windows isKindOfClass:[NSArray class]]) return;
+    for (id window in windows) {
+        if (CFGetTypeID((__bridge CFTypeRef)window) != AXUIElementGetTypeID()) continue;
+
+        if ([session->windows containsObject:window]) continue;
+        AXObserverAddNotification(session->observer, (__bridge AXUIElementRef)window,
+                                  kAXUIElementDestroyedNotification, (__bridge void *)session);
+    }
+    session->windows = windows;
+}
+
+static id restoreWindow(RestoreSession *session, AXError *failure) {
+    if (session->policy.attempts || session->policy.settling) {
+        id windows = attribute(session->element, kAXWindowsAttribute, failure);
+        if (![windows isKindOfClass:[NSArray class]] || ![windows count]) return nil;
+        id main = attribute(session->element, kAXMainWindowAttribute, failure);
+        id focused = attribute(session->element, kAXFocusedWindowAttribute, failure);
+        RestoreWindow *facts = calloc([windows count], sizeof(*facts));
+        if (!facts) return nil;
+        for (unsigned i = 0; i < [windows count]; i++) {
+            id window = windows[i];
+            if (CFGetTypeID((__bridge CFTypeRef)window) != AXUIElementGetTypeID()) continue;
+            AXUIElementRef element = (__bridge AXUIElementRef)window;
+            id children = attribute(element, kAXChildrenAttribute, failure);
+            facts[i] = (RestoreWindow){
+                .standard = [attribute(element, kAXSubroleAttribute, failure)
+                    isEqual:(__bridge NSString *)kAXStandardWindowSubrole],
+                .minimized = booleanAttribute(element, kAXMinimizedAttribute, failure) != StateWindowed,
+                .main = [window isEqual:main], .focused = [window isEqual:focused],
+                .hasChildren = [children isKindOfClass:[NSArray class]] && [children count] > 0
+            };
+        }
+        int index = restoreWindowIndex(facts, (unsigned)[windows count]);
+        free(facts);
+        return index >= 0 ? windows[index] : nil;
+    }
+    return attribute(session->element, kAXFocusedWindowAttribute, failure);
 }
 
 // App switching matters only while a launch restore is waiting for its app to come forward.
@@ -899,8 +1023,15 @@ static void attemptRestore(RestoreSession *session) {
     NSNumber *pid = @(session->app.processIdentifier);
     if (gRestores[pid] != session) return;
     if (!gTrusted || !eligible(session->app)) { finishRestore(session, NO, "unavailable"); return; }
-    if (session->readBack || !restoreDue(&session->policy, now())) {
-        os_log_debug(agentLog(), "restore check pid=%d wait", session->app.processIdentifier);
+    if (session->policy.waitingForWindow && now() < session->policy.deadline) {
+        id window = restoreWindow(session, NULL);
+        BOOL standard = window && CFGetTypeID((__bridge CFTypeRef)window) == AXUIElementGetTypeID() &&
+            [attribute((__bridge AXUIElementRef)window, kAXSubroleAttribute, NULL)
+                isEqual:(__bridge NSString *)kAXStandardWindowSubrole];
+        if (restoreStandardWindow(&session->policy, now(), standard)) scheduleRestoreSettling(session, NO);
+    }
+    if (session->settling || session->readBack || !restoreDue(&session->policy, now())) {
+        DIAG(@"restore check pid=%d wait", session->app.processIdentifier);
         return;
     }
     BOOL frontmost = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == session->app.processIdentifier;
@@ -909,8 +1040,9 @@ static void attemptRestore(RestoreSession *session) {
     Boolean writable = false;
     AXError failure = kAXErrorSuccess;
     if (frontmost && now() < session->policy.deadline && session->policy.attempts < 5) {
-        focused = attribute(session->element, kAXFocusedWindowAttribute, &failure);
+        focused = restoreWindow(session, &failure);
         if (focused && CFGetTypeID((__bridge CFTypeRef)focused) == AXUIElementGetTypeID()) {
+
             BOOL standard;
             state = windowState((__bridge AXUIElementRef)focused, &standard, &failure);
             if (!standard) state = StateUnknown;
@@ -921,10 +1053,11 @@ static void attemptRestore(RestoreSession *session) {
         }
     }
     // Check focus again after the AX round trips. Only a real write uses an attempt.
-    os_log_debug(agentLog(), "restore check pid=%d bundle=%{public}@ front=%d state=%d writable=%d ax=%d",
+    DIAG(@"restore check pid=%d bundle=%@ front=%d state=%d writable=%d ax=%d",
                 session->app.processIdentifier, session->app.bundleIdentifier, frontmost, state, writable, failure);
     if (session->app.terminated) { finishRestore(session, NO, "terminated"); return; }
     frontmost = frontmost && NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == session->app.processIdentifier;
+    BOOL settled = session->policy.settling;
     RestoreAction action = restoreAttempt(&session->policy, now(), frontmost, state, writable);
     if (action == RestoreComplete || action == RestoreGiveUp) {
         finishRestore(session, action == RestoreComplete, action == RestoreComplete ? "fullscreen" :
@@ -934,7 +1067,9 @@ static void attemptRestore(RestoreSession *session) {
     if (action == RestoreWrite) {
         if (session->app.terminated) { finishRestore(session, NO, "terminated"); return; }
         AXError error = AXUIElementSetAttributeValue((__bridge AXUIElementRef)focused, CFSTR("AXFullScreen"), kCFBooleanTrue);
-        os_log_info(agentLog(), "restore write pid=%d attempt=%u ax=%d", session->app.processIdentifier, session->policy.attempts, error);
+        (void)error;
+        DIAG(@"restore write pid=%d attempt=%u ax=%d", session->app.processIdentifier, session->policy.attempts, error);
+        if (settled) DIAG(@"restore settled write pid=%d attempt=%u", session->app.processIdentifier, session->policy.attempts);
         session->target = (AXUIElementRef)CFRetain((__bridge CFTypeRef)focused);
         __weak RestoreSession *weakSession = session;
         session->readBack = dispatch_block_create(0, ^{
@@ -945,7 +1080,7 @@ static void attemptRestore(RestoreSession *session) {
                 if (!gTrusted || !eligible(s->app)) { finishRestore(s, NO, "unavailable"); return; }
                 AXError error = kAXErrorSuccess;
                 WindowState result = booleanAttribute(s->target, CFSTR("AXFullScreen"), &error);
-                os_log_debug(agentLog(), "restore read-back pid=%d state=%d ax=%d", s->app.processIdentifier, result, error);
+                DIAG(@"restore read-back pid=%d state=%d ax=%d", s->app.processIdentifier, result, error);
                 if (s->app.terminated) { finishRestore(s, NO, "terminated"); return; }
                 CFRelease(s->target);
                 s->target = NULL;
@@ -953,6 +1088,7 @@ static void attemptRestore(RestoreSession *session) {
                 if (next == RestoreComplete || next == RestoreGiveUp)
                     finishRestore(s, next == RestoreComplete, next == RestoreComplete ? "fullscreen" :
                                   now() >= s->policy.deadline ? "timeout" : "attempts");
+                else if (next == RestoreSettle) scheduleRestoreSettling(s, NO);
                 else attemptRestore(s);
             }
         });
@@ -962,12 +1098,20 @@ static void attemptRestore(RestoreSession *session) {
 
 static void windowChanged(AXObserverRef observer, AXUIElementRef element, CFStringRef notification, void *context) {
     (void)observer; (void)element; (void)notification;
-    @autoreleasepool { attemptRestore((__bridge RestoreSession *)context); }
+    @autoreleasepool {
+        RestoreSession *session = (__bridge RestoreSession *)context;
+        if (gRestores[@(session->app.processIdentifier)] != session) return;
+        observeRestoreWindows(session);
+        restoreChanged(session, NO);
+        attemptRestore(session);
+    }
 }
 
 static void startRestore(NSRunningApplication *app) {
     if (!gReopenInFullScreen || !gTrusted || !eligible(app) || remembered(app.bundleIdentifier) != StateFullscreen) return;
-    RestorePolicy policy = restorePolicy(remembered(app.bundleIdentifier), YES, now());
+    id settle = gSettleApplications[app.bundleIdentifier];
+    RestorePolicy policy = restorePolicy(remembered(app.bundleIdentifier), YES,
+                                         builtInSettling(app.bundleIdentifier) || [settle isKindOfClass:[NSDictionary class]], now());
     NSNumber *pid = @(app.processIdentifier);
     RestoreSession *previous = gRestores[pid];
     if (previous && previous->app.terminated) finishRestore(previous, NO, "terminated");
@@ -979,17 +1123,20 @@ static void startRestore(NSRunningApplication *app) {
     gRestores[pid] = session;
     [gLastSpaceChanges removeObjectForKey:pid];  // a newly launched process has not changed Spaces yet
     updateTerminationObserver();
-    os_log_info(agentLog(), "restore start pid=%d bundle=%{public}@", app.processIdentifier, app.bundleIdentifier);
+    DIAG(@"restore start pid=%d bundle=%@", app.processIdentifier, app.bundleIdentifier);
+    if (policy.settling) DIAG(@"restore start settling pid=%d bundle=%@", app.processIdentifier, app.bundleIdentifier);
     observeRestoreActivation();
     AXError error = AXObserverCreate(app.processIdentifier, windowChanged, &session->observer);
-    os_log_debug(agentLog(), "restore observer pid=%d ax=%d", app.processIdentifier, error);
+    DIAG(@"restore observer pid=%d ax=%d", app.processIdentifier, error);
     if (error == kAXErrorSuccess) {
         for (NSString *name in @[(__bridge NSString *)kAXFocusedWindowChangedNotification,
                                  (__bridge NSString *)kAXWindowCreatedNotification,
                                  (__bridge NSString *)kAXMainWindowChangedNotification]) {
             AXError added = AXObserverAddNotification(session->observer, session->element, (__bridge CFStringRef)name, (__bridge void *)session);
-            os_log_debug(agentLog(), "restore subscribe pid=%d notification=%{public}@ ax=%d", app.processIdentifier, name, added);
+            (void)added;
+            DIAG(@"restore subscribe pid=%d notification=%@ ax=%d", app.processIdentifier, name, added);
         }
+        observeRestoreWindows(session);
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(session->observer), kCFRunLoopCommonModes);
     }
     __weak RestoreSession *weakSession = session;
@@ -1036,7 +1183,7 @@ static void updateReopen(void) {
         gAppKitEventPump = YES;
         if (gAgentRunLoopStarted) dispatch_async(dispatch_get_main_queue(), ^{ [NSApp run]; });
     }
-    os_log_debug(agentLog(), "WindowServer connection is up");
+    DIAG(@"WindowServer connection is up");
     AXUIElementRef system = AXUIElementCreateSystemWide();
     AXUIElementSetMessagingTimeout(system, 0.25);
     CFRelease(system);
@@ -1053,7 +1200,7 @@ static void updateReopen(void) {
             static BOOL receivedSpaceChange;
             if (!receivedSpaceChange) {
                 receivedSpaceChange = YES;
-                os_log_debug(agentLog(), "first Space change received");
+                DIAG(@"first Space change received");
             }
             @autoreleasepool { spaceChanged(); }
         }];
@@ -1226,7 +1373,12 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argc > 1 && !strcmp(argv[1], "--status")) return printStatus();
-        os_log_info(agentLog(), "agent start");
+#ifdef FULLSCREENKEEPER_DIAGNOSTIC_LOG
+        if (argc > 1 && !strcmp(argv[1], "--log")) return diagnosticPrint();
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(), NULL, diagnosticRequested,
+                                        LOG_REQUEST, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+#endif
+        DIAG(@"agent start");
         gTrusted = AXIsProcessTrusted();
         gPreviousSpacePID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
         gRestores = [NSMutableDictionary dictionary];

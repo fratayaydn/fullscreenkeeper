@@ -4,11 +4,21 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <IOKit/hid/IOHIDManager.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
-#include <os/log.h>
 #include <assert.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <math.h>
+
+static double testUptime;
+static BOOL useTestUptime;
+@interface TestProcessInfo : NSObject
++ (instancetype)processInfo;
+@property(readonly) NSTimeInterval systemUptime;
+@end
+@implementation TestProcessInfo
++ (instancetype)processInfo { return [self new]; }
+- (NSTimeInterval)systemUptime { return useTestUptime ? testUptime : NSProcessInfo.processInfo.systemUptime; }
+@end
 
 static unsigned applicationCreations, activationPolicyChanges, applicationRuns, runLoopRuns;
 static dispatch_block_t agentRunHook, preferenceReadHook;
@@ -107,7 +117,8 @@ static NSTaskTerminationReason childReason;
 @end
 
 static NSDictionary *preferences;
-static id ignoredPreferences;
+static id ignoredPreferences, settlePreferences;
+static unsigned settleSaves;
 static id reopenPreference, forceFnFPreference;
 static unsigned tapCreations, tapInvalidations, tapSourceCreations, tapSourceRemovals;
 static unsigned keyTapEnableCalls;
@@ -118,6 +129,10 @@ static unsigned axCalls, writes, saves, trustChecks;
 static NSString *spaceEventsPreference;
 static BOOL permission, fullscreen, nonstandard, minimized;
 static NSArray *reportedWindows;
+static NSSet *emptyWindows;
+static NSString *focusedWindow, *mainWindow, *writtenWindow;
+static BOOL mainNonstandard, observerAvailable;
+static NSMutableArray<NSArray *> *subscriptions;
 static NSMutableArray<NSNumber *> *queriedPIDs;
 static AXError windowsError, fullscreenError;
 static NSMutableArray<NSString *> *logs;
@@ -238,6 +253,10 @@ static void testAddSource(CFRunLoopRef loop, CFRunLoopSourceRef source, CFRunLoo
         assert(loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
         return;
     }
+    if (CFEqual(source, CFSTR("restoreSource"))) {
+        assert(loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
+        return;
+    }
     assert(loop == CFRunLoopGetMain() && CFEqual(source, CFSTR("source")) && mode == kCFRunLoopCommonModes);
     addedSources++;
 }
@@ -266,6 +285,7 @@ static void testTapInvalidate(CFMachPortRef tap) {
 }
 static void testRemoveSource(CFRunLoopRef loop, CFRunLoopSourceRef source, CFRunLoopMode mode) {
     assert(loop == CFRunLoopGetMain() && mode == kCFRunLoopCommonModes);
+    if (CFEqual(source, CFSTR("restoreSource"))) return;
     if (CFEqual(source, CFSTR("source"))) { removedSpaceSources++; return; }
     assert(CFEqual(source, CFSTR("fnFKeySource")));
     tapSourceRemovals++;
@@ -357,7 +377,6 @@ static AXError testTimeout(AXUIElementRef element, float timeout) {
 }
 static CFTypeID testElementType(void) { return CFStringGetTypeID(); }
 static AXError testAttribute(AXUIElementRef element, CFStringRef key, CFTypeRef *value) {
-    (void)element;
     axCalls++;
     if (terminateDuringAttribute && CFEqual(key, terminateDuringAttribute)) workspace.frontmostApplication.terminated = YES;
     id result = nil;
@@ -365,8 +384,10 @@ static AXError testAttribute(AXUIElementRef element, CFStringRef key, CFTypeRef 
         if (windowsError != kAXErrorSuccess) { *value = NULL; return windowsError; }
         result = reportedWindows;
     }
-    else if (CFEqual(key, kAXFocusedWindowAttribute)) result = @"window";
-    else if (CFEqual(key, kAXSubroleAttribute)) result = (__bridge NSString *)(nonstandard ? kAXDialogSubrole : kAXStandardWindowSubrole);
+    else if (CFEqual(key, kAXFocusedWindowAttribute)) result = focusedWindow;
+    else if (CFEqual(key, kAXMainWindowAttribute)) result = mainWindow;
+    else if (CFEqual(key, kAXChildrenAttribute)) result = [emptyWindows containsObject:(__bridge id)element] ? @[] : @[@"child"];
+    else if (CFEqual(key, kAXSubroleAttribute)) result = (__bridge NSString *)((CFEqual(element, CFSTR("main")) ? mainNonstandard : nonstandard) ? kAXDialogSubrole : kAXStandardWindowSubrole);
     else if (CFEqual(key, kAXMinimizedAttribute)) result = @(minimized);
     else if (CFEqual(key, CFSTR("AXFullScreen"))) {
         if (fullscreenError != kAXErrorSuccess) { *value = NULL; return fullscreenError; }
@@ -388,13 +409,23 @@ static AXError testWrite(AXUIElementRef element, CFStringRef key, CFTypeRef valu
     axCalls++;
     writes++;
     lastWrittenFullscreen = CFBooleanGetValue(value);
+    writtenWindow = (__bridge NSString *)element;
     return kAXErrorSuccess;
 }
 static AXError testObserver(pid_t pid, AXObserverCallback callback, AXObserverRef *observer) {
     (void)pid; (void)callback;
     axCalls++;
-    *observer = NULL;
-    return kAXErrorCannotComplete;
+    *observer = observerAvailable ? (AXObserverRef)CFRetain(CFSTR("restoreObserver")) : NULL;
+    return observerAvailable ? kAXErrorSuccess : kAXErrorCannotComplete;
+}
+static AXError testSubscribe(AXObserverRef observer, AXUIElementRef element, CFStringRef notification, void *context) {
+    assert(CFEqual(observer, CFSTR("restoreObserver")) && context);
+    [subscriptions addObject:@[(__bridge id)element, (__bridge NSString *)notification]];
+    return kAXErrorSuccess;
+}
+static CFRunLoopSourceRef testObserverSource(AXObserverRef observer) {
+    assert(CFEqual(observer, CFSTR("restoreObserver")));
+    return (CFRunLoopSourceRef)CFSTR("restoreSource");
 }
 static Boolean testSynchronize(CFStringRef domain) { (void)domain; return true; }
 static CFPropertyListRef testCopyPreference(CFStringRef key, CFStringRef domain) {
@@ -410,6 +441,8 @@ static CFPropertyListRef testCopyPreference(CFStringRef key, CFStringRef domain)
         }
         return value;
     }
+    if (CFEqual(key, CFSTR("SettleApplications")))
+        return settlePreferences ? CFRetain((__bridge CFTypeRef)settlePreferences) : NULL;
     assert(CFEqual(key, CFSTR("Applications")) || CFEqual(key, CFSTR("IgnoredApplications")));
     id value = CFEqual(key, CFSTR("IgnoredApplications")) ? ignoredPreferences : preferences;
     return value ? CFRetain((__bridge CFTypeRef)value) : NULL;
@@ -418,6 +451,12 @@ static void testSavePreference(CFStringRef key, CFPropertyListRef value, CFStrin
     assert(CFEqual(domain, CFSTR("io.github.fratayaydn.fullscreenkeeper")));
     if (CFEqual(key, CFSTR("SpaceEventsPath"))) {
         spaceEventsPreference = (__bridge NSString *)value;
+        return;
+    }
+    if (CFEqual(key, CFSTR("SettleApplications"))) {
+        settlePreferences = (__bridge NSDictionary *)value;
+        settleSaves++;
+        saves++;
         return;
     }
     assert(CFEqual(key, CFSTR("Applications")));
@@ -432,11 +471,10 @@ static dispatch_time_t testDispatchTime(dispatch_time_t when, int64_t delta) {
     [scheduledDelays addObject:@((double)delta / NSEC_PER_SEC)];
     return dispatch_time(when, delta);
 }
-static void testLog(const char *format, ...) {
-    NSString *plain = [@(format) stringByReplacingOccurrencesOfString:@"{public}" withString:@""];
+static void testLog(NSString *format, ...) {
     va_list arguments;
     va_start(arguments, format);
-    [logs addObject:[[NSString alloc] initWithFormat:plain arguments:arguments]];
+    [logs addObject:[[NSString alloc] initWithFormat:format arguments:arguments]];
     va_end(arguments);
 }
 static void testRunLoop(void) { runLoopRuns++; if (agentRunHook) agentRunHook(); }
@@ -447,6 +485,7 @@ static void testAsync(dispatch_queue_t queue, dispatch_block_t block) {
 static void testExit(int status) { restartStatus = status; }
 
 #define NSRunningApplication TestApplication
+#define NSProcessInfo TestProcessInfo
 #define NSApplication TestAgentApplication
 #define NSApp testApp
 #define NSWorkspace TestWorkspace
@@ -461,6 +500,8 @@ static void testExit(int status) { restartStatus = status; }
 #define AXUIElementIsAttributeSettable testSettable
 #define AXUIElementSetAttributeValue testWrite
 #define AXObserverCreate testObserver
+#define AXObserverAddNotification testSubscribe
+#define AXObserverGetRunLoopSource testObserverSource
 #define CFPreferencesAppSynchronize testSynchronize
 #define CFPreferencesCopyAppValue testCopyPreference
 #define CFPreferencesSetAppValue testSavePreference
@@ -496,13 +537,12 @@ static void testExit(int status) { restartStatus = status; }
 #define IOHIDValueGetIntegerValue testHIDInput
 #define exit testExit
 static BOOL debugLogging;
-#define os_log_type_enabled(log, type) ((void)(log), (void)(type), debugLogging)
-#undef os_log_debug
-#define os_log_debug(log, format, ...) do { if (debugLogging) { (void)(log); testLog(format, ##__VA_ARGS__); } } while (0)
-#undef os_log_info
-#define os_log_info(log, format, ...) ((void)(log), testLog(format, ##__VA_ARGS__))
-#undef os_log_error
-#define os_log_error(log, format, ...) ((void)(log), testLog(format, ##__VA_ARGS__))
+#define FULLSCREENKEEPER_DIAGNOSTIC_LOG
+#import "../Sources/Agent/DiagnosticLog.h"
+#undef DIAG_ENABLED
+#define DIAG_ENABLED debugLogging
+#undef DIAG
+#define DIAG(...) do { if (debugLogging) { diagnosticAdd([NSString stringWithFormat:__VA_ARGS__]); testLog(__VA_ARGS__); } } while (0)
 static unsigned updaterCalls;
 static BOOL updaterForce, updaterInstall;
 static int testUpdaterRun(BOOL force, BOOL install) {
@@ -543,6 +583,8 @@ static void reset(void) {
     gProtected = [NSMutableDictionary dictionary];
     gApplications = preferences = @{};
     gIgnoredApplications = ignoredPreferences = @{};
+    gSettleApplications = settlePreferences = @{};
+    settleSaves = 0;
     reopenPreference = forceFnFPreference = nil;
     gReopenInFullScreen = YES;
     // Direct policy seams below simulate an already started reopen feature.
@@ -566,6 +608,13 @@ static void reset(void) {
     spaceEventsPreference = nil;
     fullscreen = nonstandard = minimized = terminateDuringSettable = NO;
     reportedWindows = @[@"window"];
+    emptyWindows = [NSSet set];
+    testUptime = 100;
+    useTestUptime = NO;
+    focusedWindow = @"window";
+    mainWindow = writtenWindow = nil;
+    mainNonstandard = observerAvailable = NO;
+    subscriptions = [NSMutableArray array];
     queriedPIDs = [NSMutableArray array];
     logs = [NSMutableArray array];
     scheduledDelays = [NSMutableArray array];
@@ -687,18 +736,23 @@ static void reopenOffAtStartup(void) {
 static void legacySettingsCleanup(void) {
     reset();
     TestApplication *kept = application(90, YES);
-    NSDictionary *entry = preferences[kept.bundleIdentifier];
+    gApplications = preferences = @{ kept.bundleIdentifier: @{ @"name": kept.localizedName, @"fullscreen": @YES, @"settle": @YES } };
+    NSDictionary *entry = @{ @"name": kept.localizedName, @"fullscreen": @YES };
     NSMutableDictionary *records = [preferences mutableCopy];
     records[@"test.old.windowed"] = @{ @"name": @"Old Windowed App", @"fullscreen": @NO };
     preferences = records;
     loadSettings();
-    assert(saves == 1 && gApplications.count == 1 && preferences.count == 1);
+    assert(saves == 2 && settleSaves == 1 && gApplications.count == 1 && preferences.count == 1);
+    assert(([settlePreferences[kept.bundleIdentifier] isEqual:@{ @"name": kept.localizedName }]));
     assert([preferences[kept.bundleIdentifier] isEqual:entry]);
     assert(remembered(kept.bundleIdentifier) == StateFullscreen);
     assert(remembered(@"test.old.windowed") == StateWindowed);
     assert(remembered(@"test.absent") == StateWindowed);
     loadSettings();
-    assert(saves == 1);  // migration writes once
+    readSettings();
+    saveState(kept, StateFullscreen);
+    assert([preferences[kept.bundleIdentifier] isEqual:entry]);
+    assert(saves == 2 && settleSaves == 1);  // migration writes each changed key once
 }
 
 static void immediateExitRemovesEntry(void) {
@@ -741,19 +795,27 @@ static void startupKeepsEntries(void) {
 
 static void failedRestoreKeepsEntry(void) {
     reset();
+    useTestUptime = YES;
     TestApplication *app = application(95, YES);
     workspace.frontmostApplication = app;
-    NSDictionary *before = preferences;
     startRestore(app);
     RestoreSession *session = gRestores[@95];
     for (unsigned attempt = 0; attempt < 5; attempt++) {
         assert(writes == attempt + 1 && session->readBack);
         dispatch_block_t readBack = session->readBack;
+        testUptime += 1.2;
         readBack();
+        if (attempt < 4) {
+            assert(session->settling && !session->readBack && writes == attempt + 1);
+            testUptime += 1;
+            dispatch_block_t settling = session->settling;
+            settling();
+        }
     }
     assert(!gRestores.count && gProtected[@95] == app);
     recordApplication(app, NO, "now");
-    assert(saves == 0 && [preferences isEqual:before]);
+    // A read-back that never reaches full screen is not proof that the app undid the write.
+    assert(saves == 0 && !settlePreferences[app.bundleIdentifier]);
     assert(remembered(app.bundleIdentifier) == StateFullscreen);
     fullscreen = YES;
     recordApplication(app, NO, "now");
@@ -1914,6 +1976,353 @@ static void terminatedRecording(void) {
     }
 }
 
+static void launchRestoreSettling(void) {
+    reset();
+    useTestUptime = YES;
+    TestApplication *app = application(106, YES);
+    workspace.frontmostApplication = app;
+    startRestore(app);
+    RestoreSession *session = gRestores[@106];
+    assert(writes == 1 && !session->settling && [writtenWindow isEqual:@"window"]);
+    assert(writes == 1 && !session->policy.settling);
+    fullscreen = YES;
+    testUptime += 1.2;
+    dispatch_block_t readBack = session->readBack;
+    readBack();
+    assert(!gRestores.count && writes == 1 && !session->settling);
+    assert(saves == 0 && !settlePreferences[app.bundleIdentifier]);
+
+    for (unsigned path = 0; path < 5; path++) {
+        reset();
+        useTestUptime = YES;
+        observerAvailable = YES;
+        app = application(106, YES);
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        session = gRestores[@106];
+        assert(subscriptions.count == 4);
+        assert(([subscriptions.lastObject isEqual:@[@"window", (__bridge NSString *)kAXUIElementDestroyedNotification]]));
+        reportedWindows = @[@"window", @"main"];
+        readBack = session->readBack;
+        testUptime += 1.2;
+        if (path == 1) {
+            recordFullscreenSpace(1327, 30, app);
+            recordFullscreenSpace(1328, 30, app);
+            assert(dispatch_block_testcancel(readBack));
+        } else readBack();
+        assert(session->policy.settling && session->settling && !session->readBack && writes == 1);
+        // Only a destroyed full-screen Space marks the app; a read-back alone does not.
+        assert(path == 1 ? saves == 1 && [settlePreferences[app.bundleIdentifier] isKindOfClass:[NSDictionary class]] :
+                           saves == 0 && !settlePreferences[app.bundleIdentifier]);
+        assert(scheduledDelays.lastObject.doubleValue == 1);
+        dispatch_block_t settling = session->settling;
+        testUptime += 0.9;
+        attemptRestore(session);
+        assert(writes == 1);
+        CFStringRef events[] = { kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification,
+                                kAXMainWindowChangedNotification, kAXUIElementDestroyedNotification };
+        for (unsigned i = 0; i < 4; i++) {
+            windowChanged(NULL, NULL, events[i], (__bridge void *)session);
+            assert(subscriptions.count == 5);
+            assert(([subscriptions.lastObject isEqual:@[@"main", (__bridge NSString *)kAXUIElementDestroyedNotification]]));
+            assert(dispatch_block_testcancel(settling));
+            assert(session->policy.nextAttempt == testUptime + 1 && writes == 1);
+            assert(scheduledDelays.lastObject.doubleValue == 1);
+            settling = session->settling;
+            testUptime += 0.1;
+        }
+        recordFullscreenSpace(1327, 31, app);
+        assert(dispatch_block_testcancel(settling));
+        settling = session->settling;
+        recordFullscreenSpace(1328, 31, app);
+        assert(dispatch_block_testcancel(settling));
+        settling = session->settling;
+        assert(saves == 1);
+        mainWindow = @"main";
+        nonstandard = path != 4;
+        mainNonstandard = path == 4;
+        if (path == 2) {
+            mainNonstandard = YES;
+            testUptime += 1;
+            settling();
+            assert(writes == 1 && gRestores[@106] == session);
+            session->expiry();
+            assert(!gRestores.count);
+        } else if (path == 3) {
+            testUptime = session->policy.deadline;
+            session->expiry();
+            assert(dispatch_block_testcancel(settling));
+            settling();
+            assert(writes == 1 && !gRestores.count && gProtected[@106] == app);
+        } else {
+            testUptime += 1;
+            settling();
+            assert(writes == 2 && [writtenWindow isEqual:(path == 4 ? @"window" : @"main")] && session->readBack);
+            fullscreen = YES;
+            readBack = session->readBack;
+            testUptime += 1.2;
+            readBack();
+            assert(!gRestores.count && writes == 2);
+        }
+    }
+
+    reset();
+    app = application(106, YES);
+    workspace.frontmostApplication = app;
+    nonstandard = YES;
+    startRestore(app);
+    assert(writes == 0);
+}
+
+static void builtInRestoreSettling(void) {
+    for (unsigned path = 0; path < 4; path++) {
+        reset();
+        useTestUptime = observerAvailable = YES;
+        TestApplication *app = application(112, NO);
+        app.bundleIdentifier = @"com.openai.codex";
+        gApplications = preferences = @{ app.bundleIdentifier: @{ @"fullscreen": @YES } };
+        workspace.frontmostApplication = app;
+        if (path == 1) gIgnoredApplications = @{ app.bundleIdentifier: @{} };
+        if (path == 2) emptyWindows = [NSSet setWithObject:@"window"];
+        startRestore(app);
+        if (path == 1) {
+            assert(!gRestores.count && !writes && !axCalls && !saves && !settleSaves);
+            continue;
+        }
+        RestoreSession *session = gRestores[@112];
+        assert(session && session->policy.settling && !writes && !saves && !settleSaves);
+        assert(![settlePreferences count]);
+        saveRestoreSettling(session);
+        assert(!settleSaves && ![settlePreferences count]);
+        if (path == 2) {
+            assert(session->policy.waitingForWindow && !session->settling);
+            testUptime = session->policy.deadline - 0.001;
+            attemptRestore(session);
+            assert(gRestores[@112] == session && !writes && !session->policy.attempts);
+            testUptime = session->policy.deadline;
+            attemptRestore(session);
+            assert(!gRestores.count && !writes && !saves && !settleSaves);
+            continue;
+        }
+        assert(!session->policy.waitingForWindow && session->settling);
+        if (path == 3) {
+            // The old main window can remain after its contents disappear.
+            mainWindow = @"window";
+            focusedWindow = @"main";
+            reportedWindows = @[@"window", @"main"];
+            emptyWindows = [NSSet setWithObject:@"window"];
+            windowChanged(NULL, NULL, kAXWindowCreatedNotification, (__bridge void *)session);
+        }
+        testUptime = session->policy.nextAttempt;
+        dispatch_block_t settling = session->settling;
+        settling();
+        assert(writes == 1 && [writtenWindow isEqual:(path == 3 ? @"main" : @"window")]);
+        assert(!saves && !settleSaves && ![settlePreferences count]);
+    }
+}
+
+static void rememberedRestoreSettling(void) {
+    for (unsigned path = 0; path < 4; path++) {
+        reset();
+        useTestUptime = observerAvailable = YES;
+        TestApplication *app = application(107, YES);
+        gSettleApplications = settlePreferences = @{ app.bundleIdentifier: @{ @"name": app.localizedName } };
+        workspace.frontmostApplication = app;
+        focusedWindow = nil;
+        reportedWindows = @[];
+        startRestore(app);
+        RestoreSession *session = gRestores[@107];
+        assert(session->policy.settling && session->policy.waitingForWindow && !session->settling && writes == 0);
+        testUptime += 5;
+        windowChanged(NULL, NULL, kAXWindowCreatedNotification, (__bridge void *)session);
+        attemptRestore(session);
+        assert(!session->settling && session->policy.waitingForWindow && writes == 0);
+        if (path == 0) {
+            testUptime = session->policy.deadline;
+            attemptRestore(session);
+            assert(!gRestores.count && writes == 0 && saves == 0);
+            continue;
+        }
+        focusedWindow = @"window";
+        reportedWindows = @[@"window"];
+        windowChanged(NULL, NULL, kAXWindowCreatedNotification, (__bridge void *)session);
+        assert(!session->policy.waitingForWindow && session->settling && writes == 0);
+        assert(session->policy.nextAttempt == testUptime + 1);
+        dispatch_block_t settling = session->settling;
+        testUptime += 0.999;
+        attemptRestore(session);
+        assert(writes == 0);
+        CFStringRef events[] = { kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification,
+                                kAXMainWindowChangedNotification, kAXUIElementDestroyedNotification };
+        for (unsigned i = 0; i < 4; i++) {
+            windowChanged(NULL, NULL, events[i], (__bridge void *)session);
+            assert(dispatch_block_testcancel(settling) && writes == 0);
+            assert(session->policy.nextAttempt == testUptime + 1);
+            settling = session->settling;
+            testUptime += 0.1;
+        }
+        mainWindow = @"main";
+        mainNonstandard = path == 2;
+        reportedWindows = @[@"window", @"main"];
+        if (path == 3) workspace.frontmostApplication = nil;
+        testUptime = session->policy.nextAttempt;
+        settling();
+        if (path == 3) {
+            assert(writes == 0);
+            workspace.frontmostApplication = app;
+            attemptRestore(session);
+        }
+        assert(writes == 1 && [writtenWindow isEqual:(path == 2 ? @"window" : @"main")]);
+        testUptime += 1.2;
+        dispatch_block_t readBack = session->readBack;
+        readBack();
+        assert(session->settling && session->policy.attempts == 1 && saves == 0);
+        testUptime += 1;
+        settling = session->settling;
+        settling();
+        assert(writes == 2 && saves == 0);
+    }
+
+    for (unsigned ignoredApp = 0; ignoredApp < 2; ignoredApp++) {
+        reset();
+        useTestUptime = YES;
+        TestApplication *app = application(108, YES);
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        RestoreSession *session = gRestores[@108];
+        if (ignoredApp) ignoredPreferences = @{ app.bundleIdentifier: @{} };
+        else preferences = @{};
+        testUptime += 1.2;
+        recordFullscreenSpace(1327, 32, app);
+        recordFullscreenSpace(1328, 32, app);
+        assert(session->policy.settling && saves == 1 && !preferences[app.bundleIdentifier]);
+        assert(settleSaves == !ignoredApp && (settlePreferences[app.bundleIdentifier] != nil) == !ignoredApp);
+    }
+}
+
+static void independentSettlingFlags(void) {
+    for (unsigned path = 0; path < 3; path++) {
+        reset();
+        useTestUptime = YES;
+        TestApplication *app = application(109, YES);
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        RestoreSession *session = gRestores[@109];
+        recordFullscreenSpace(1327, 40, app);
+        recordFullscreenSpace(1328, 40, app);
+        assert(settleSaves == 1 && !preferences[app.bundleIdentifier][@"settle"]);
+        NSDictionary *flags = settlePreferences;
+        finishRestore(session, NO, "test");
+        if (path == 0) saveState(app, StateWindowed);
+        else if (path == 1) preferences = @{};  // forgotten in settings
+        else preferences = @{ app.bundleIdentifier: @{ @"name": app.localizedName, @"fullscreen": @NO } };
+        loadSettings();
+        assert(!preferences[app.bundleIdentifier] && [settlePreferences isEqual:flags]);
+        saveState(app, StateFullscreen);
+        assert(preferences[app.bundleIdentifier] && !preferences[app.bundleIdentifier][@"settle"]);
+        assert([settlePreferences isEqual:flags] && settleSaves == 1);
+        startRestore(app);
+        session = gRestores[@109];
+        assert(session->policy.settling && writes == 1);
+        saveRestoreSettling(session);
+        assert([settlePreferences isEqual:flags] && settleSaves == 1);
+    }
+}
+
+static void settlingMigration(void) {
+    for (unsigned disabled = 0; disabled < 2; disabled++) {
+        reset();
+        reopenPreference = @(!disabled);
+        preferences = @{
+            @"test.migrate": @{ @"name": @"Migrate", @"fullscreen": @YES, @"settle": @YES },
+            @"test.windowed": @{ @"name": @"Windowed", @"fullscreen": @NO, @"settle": @YES },
+            @"test.existing": @{ @"name": @"New Name", @"fullscreen": @YES, @"settle": @YES },
+            @"test.ignored": @{ @"name": @"Ignored", @"fullscreen": @YES, @"settle": @YES },
+            @"test.false": @{ @"fullscreen": @YES, @"settle": @NO },
+            @"test.string": @{ @"fullscreen": @YES, @"settle": @"YES" },
+            @"test.array": @{ @"fullscreen": @YES, @"settle": @[] },
+            @"test.dictionary": @{ @"fullscreen": @YES, @"settle": @{} },
+            @"test.unnamed": @{ @"name": @42, @"fullscreen": @YES, @"settle": @YES }
+        };
+        ignoredPreferences = @{ @"test.ignored": @{} };
+        settlePreferences = @{ @"test.existing": @{ @"name": @"Original Name" },
+                               @"test.absent": @{ @"name": @"Absent" }, @"test.migrate": @YES };
+        loadSettings();
+        assert(saves == 2 && settleSaves == 1);
+        assert(([settlePreferences isEqual:@{
+            @"test.migrate": @{ @"name": @"Migrate" }, @"test.windowed": @{ @"name": @"Windowed" },
+            @"test.existing": @{ @"name": @"Original Name" }, @"test.absent": @{ @"name": @"Absent" },
+            @"test.unnamed": @{ @"name": @"test.unnamed" }
+        }]));
+        for (NSDictionary *entry in preferences.allValues) assert(!entry[@"settle"]);
+        assert((preferences[@"test.windowed"] != nil) == disabled);
+        assert((preferences[@"test.ignored"] != nil) == disabled);
+        loadSettings();
+        readSettings();
+        assert(saves == 2 && settleSaves == 1);
+    }
+}
+
+static void settlingTypeSafety(void) {
+    for (id value in @[@"invalid", @YES, @[], NSNull.null]) {
+        reset();
+        settlePreferences = value == NSNull.null ? nil : value;
+        TestApplication *app = application(110, YES);
+        loadSettings();
+        assert(!gSettleApplications.count && !saves);
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        RestoreSession *session = gRestores[@110];
+        assert(!session->policy.settling && writes == 1);
+        recordFullscreenSpace(1327, 41, app);
+        recordFullscreenSpace(1328, 41, app);
+        assert(settleSaves == 1 && [settlePreferences[app.bundleIdentifier] isKindOfClass:[NSDictionary class]]);
+    }
+    for (id entry in @[@YES, @NO, @"YES", @[], @{}, @{ @"name": @42 }]) {
+        reset();
+        TestApplication *app = application(110, YES);
+        settlePreferences = @{ app.bundleIdentifier: entry };
+        loadSettings();
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        RestoreSession *session = gRestores[@110];
+        BOOL flagged = [entry isKindOfClass:[NSDictionary class]];
+        assert(session->policy.settling == flagged && writes == !flagged && !saves);
+        saveRestoreSettling(session);
+        assert(settleSaves == !flagged);
+        assert([settlePreferences[app.bundleIdentifier] isKindOfClass:[NSDictionary class]]);
+    }
+}
+
+static void ignoredSettlingFlags(void) {
+    for (unsigned flagged = 0; flagged < 2; flagged++) {
+        reset();
+        TestApplication *app = application(111, YES);
+        if (flagged) settlePreferences = @{ app.bundleIdentifier: @{ @"name": app.localizedName } };
+        NSDictionary *flags = settlePreferences;
+        ignoredPreferences = @{ app.bundleIdentifier: @{} };
+        loadSettings();
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        assert(!gRestores.count && !writes && !axCalls);
+        RestoreSession *session = [RestoreSession new];
+        session->app = app;
+        saveRestoreSettling(session);
+        assert(!settleSaves && [settlePreferences isEqual:flags]);
+        // A stale Applications entry still cannot start an ignored restore.
+        gApplications = @{ app.bundleIdentifier: @{ @"fullscreen": @YES } };
+        startRestore(app);
+        assert(!gRestores.count && !writes && !axCalls);
+        ignoredPreferences = @{};
+        loadSettings();
+        saveState(app, StateFullscreen);
+        startRestore(app);
+        session = gRestores[@111];
+        assert(session && session->policy.settling == flagged && writes == !flagged);
+        assert([settlePreferences isEqual:flags]);
+    }
+}
+
 static void terminatedRestoreSteps(void) {
     for (unsigned step = 0; step < 5; step++) {
         reset();
@@ -1991,8 +2400,10 @@ static void ignoredSettingsCleanup(void) {
 
 static void ignoredEventPaths(void) {
     // Space handling never remembers or restores ignored apps. Force fn-F still toggles them.
-    for (unsigned path = 0; path < 4; path++) {
+    for (unsigned path = 0; path < 5; path++) {
         reset();
+        useTestUptime = YES;
+        observerAvailable = YES;
         privateAPIAvailable = path != 3;
         forceFnFPreference = @YES;
         if (path == 1) missingSymbol = "SLSSpaceGetType";
@@ -2412,6 +2823,13 @@ int main(void) {
         launchAndObserverLifetime();
         permissionChangeChecks();
         terminatedRecording();
+        launchRestoreSettling();
+        builtInRestoreSettling();
+        rememberedRestoreSettling();
+        independentSettlingFlags();
+        settlingMigration();
+        settlingTypeSafety();
+        ignoredSettlingFlags();
         terminatedRestoreSteps();
         ignoredSettingsCleanup();
         ignoredEventPaths();
@@ -2424,7 +2842,7 @@ int main(void) {
         fnFTimeoutRecovery();
         fnFReleaseOrder();
         fnFDeferredToggle();
-        puts("Passed agent checks: legacy settings cleanup, immediate exits remove entries, startup keeps entries, failed restores keep entries,");
+        puts("Passed agent checks: built-in settling without preference writes, ignored built-in exclusion, empty-window deadline, settled target fallback, independent settling flags survive removal and re-adding, legacy flag migration, ignored flag exclusion, flag type safety, remembered settling flags, delayed flagged launches, no-window deadline, launch restore settling, main standard window selection, quiet wait resets, settling deadline, legacy settings cleanup, immediate exits remove entries, startup keeps entries, failed restores keep entries,");
         puts("cached trust, WindowServer startup without NSApplication, event draining and release, private API fallback failures, transition registration fallbacks and Space ID decoding,");
         puts("type 4 creation saves without AX, non-full-screen types ignored, event-time frontmost apps, per-Space ownership,");
         puts("startup Space enumeration and owner lookup, unknown-owner exits check the event-time frontmost app, conservative exit rules,");

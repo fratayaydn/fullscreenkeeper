@@ -6,7 +6,7 @@
 
 typedef enum { StateUnknown = -1, StateWindowed, StateFullscreen } WindowState;
 typedef enum { RecordNothing, RecordFullscreen, RecordWindowed } RecordAction;
-typedef enum { RestoreWait, RestoreWrite, RestoreComplete, RestoreGiveUp } RestoreAction;
+typedef enum { RestoreWait, RestoreSettle, RestoreWrite, RestoreComplete, RestoreGiveUp } RestoreAction;
 typedef enum { FnFPass, FnFSwallow, FnFToggle } FnFAction;
 enum {
     FnFShiftMask = 1 << 17, FnFControlMask = 1 << 18, FnFOptionMask = 1 << 19,
@@ -16,19 +16,32 @@ enum {
 typedef struct {
     bool pending;
     bool awaitingReadBack;
+    bool settling;
+    bool waitingForWindow;
     unsigned attempts;  // AXFullScreen writes, including calls that return an error
     double deadline;
     double nextAttempt;
 } RestorePolicy;
 
+typedef struct {
+    bool standard;
+    bool minimized;
+    bool main;
+    bool focused;
+    bool hasChildren;
+} RestoreWindow;
+
+int restoreWindowIndex(const RestoreWindow *windows, unsigned count);
 WindowState combineWindows(WindowState accumulated, WindowState window);
 bool shouldQuerySpaceChange(int previousPID, int frontmostPID, WindowState saved);
 RecordAction recordAction(WindowState saved, WindowState observed, bool restoring, bool protected);
 RecordAction startupRecordAction(WindowState saved, WindowState observed);
-RestorePolicy restorePolicy(WindowState saved, bool newlyLaunched, double now);
+RestorePolicy restorePolicy(WindowState saved, bool newlyLaunched, bool settle, double now);
+bool restoreStandardWindow(RestorePolicy *policy, double now, bool standard);
 bool restoreDue(const RestorePolicy *policy, double now);
 RestoreAction restoreAttempt(RestorePolicy *policy, double now, bool frontmost, WindowState focused, bool writable);
 RestoreAction restoreReadBack(RestorePolicy *policy, double now, WindowState observed);
+bool restoreWindowEvent(RestorePolicy *policy, double now, bool fullscreenDestroyed);
 FnFAction fnFAction(unsigned keycode, uint64_t flags, bool keyDown, bool autorepeat,
                     bool unknownOrSelf, bool swallowedDown);
 

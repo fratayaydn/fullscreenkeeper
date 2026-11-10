@@ -4,9 +4,6 @@ import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 import UserNotifications
-import os.log
-
-private let updateLog = OSLog(subsystem: "io.github.fratayaydn.fullscreenkeeper", category: "updater")
 
 // Each callback owns its reply until completion, including after a timeout. The semaphore publishes the result.
 final class NotificationReply<Value>: @unchecked Sendable {
@@ -20,7 +17,6 @@ final class NotificationReply<Value>: @unchecked Sendable {
 
     func wait(_ step: String, deadline: DispatchTime = .now() + 30) throws -> Value {
         guard done.wait(timeout: deadline) == .success, let result else {
-            os_log("%{public}@ timed out", log: updateLog, type: .error, step)
             throw NSError(domain: "FullscreenKeeper.NotificationTimeout", code: 1)
         }
         return try result.get()
@@ -72,7 +68,6 @@ func notifyUpdate(
             authorization = try status()
         }
         guard authorization == .authorized || authorization == .provisional else {
-            os_log("Notifications are not allowed", log: updateLog, type: .info)
             return 0
         }
         let installed = arguments[3] == "--installed"
@@ -82,11 +77,8 @@ func notifyUpdate(
         content.body = installed ? "The update was installed successfully." : "Open settings to install the update."
         let request = UNNotificationRequest(identifier: "release-update", content: content, trigger: nil)
         try post(request)
-        os_log("Release notification posted", log: updateLog, type: .info)
         return 0
     } catch {
-        let error = error as NSError
-        os_log("Release notification failed: %{public}@ %ld", log: updateLog, type: .error, error.domain, error.code)
         return 1
     }
 }

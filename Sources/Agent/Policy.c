@@ -1,5 +1,16 @@
 #include "Policy.h"
 
+int restoreWindowIndex(const RestoreWindow *windows, unsigned count) {
+    int first = -1, focused = -1;
+    for (unsigned i = 0; i < count; i++) {
+        if (!windows[i].standard || windows[i].minimized || !windows[i].hasChildren) continue;
+        if (windows[i].main) return (int)i;
+        if (focused < 0 && windows[i].focused) focused = (int)i;
+        if (first < 0) first = (int)i;
+    }
+    return focused >= 0 ? focused : first;
+}
+
 FnFAction fnFAction(unsigned keycode, uint64_t flags, bool keyDown, bool autorepeat,
                     bool unknownOrSelf, bool swallowedDown) {
     if (keycode != 3) return FnFPass;  // kVK_ANSI_F
@@ -30,14 +41,22 @@ RecordAction startupRecordAction(WindowState saved, WindowState observed) {
     return observed == StateFullscreen && saved != observed ? RecordFullscreen : RecordNothing;
 }
 
-RestorePolicy restorePolicy(WindowState saved, bool newlyLaunched, double now) {
+RestorePolicy restorePolicy(WindowState saved, bool newlyLaunched, bool settle, double now) {
     return (RestorePolicy){ .pending = newlyLaunched && saved == StateFullscreen,
+                            .settling = settle, .waitingForWindow = settle,
                             .deadline = now + 15, .nextAttempt = now };
+}
+
+bool restoreStandardWindow(RestorePolicy *policy, double now, bool standard) {
+    if (!policy->pending || !policy->waitingForWindow || !standard || now >= policy->deadline) return false;
+    policy->waitingForWindow = false;
+    policy->nextAttempt = now + 1;
+    return true;
 }
 
 bool restoreDue(const RestorePolicy *policy, double now) {
     return policy->pending && (now >= policy->deadline ||
-                              (!policy->awaitingReadBack && now >= policy->nextAttempt));
+                              (!policy->waitingForWindow && !policy->awaitingReadBack && now >= policy->nextAttempt));
 }
 
 RestoreAction restoreAttempt(RestorePolicy *policy, double now, bool frontmost, WindowState focused, bool writable) {
@@ -55,6 +74,7 @@ RestoreAction restoreAttempt(RestorePolicy *policy, double now, bool frontmost, 
         policy->pending = false;
         return RestoreGiveUp;
     }
+    policy->settling = false;
     policy->attempts++;
     policy->awaitingReadBack = true;
     policy->nextAttempt = now + 1.2;
@@ -78,5 +98,15 @@ RestoreAction restoreReadBack(RestorePolicy *policy, double now, WindowState obs
         policy->pending = false;
         return RestoreGiveUp;
     }
-    return RestoreWait;
+    policy->settling = true;
+    policy->nextAttempt = now + 1;
+    return RestoreSettle;
+}
+
+bool restoreWindowEvent(RestorePolicy *policy, double now, bool fullscreenDestroyed) {
+    if (!policy->pending || (!policy->settling && !(fullscreenDestroyed && policy->attempts))) return false;
+    policy->settling = true;
+    policy->awaitingReadBack = false;
+    policy->nextAttempt = now + 1;
+    return true;
 }
