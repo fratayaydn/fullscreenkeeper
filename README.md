@@ -20,6 +20,8 @@ The two toggles work independently. Use either one on its own, or both together.
   in full screen when you reopen them. It is on by default. Turning it off keeps the remembered list for later.
 - When you leave full screen and then quit, the app is forgotten and opens normally.
 - Apps that restore full screen on their own are left alone.
+- Some apps, such as ChatGPT, open a temporary start window before their real window. FullscreenKeeper notices
+  this, waits until the app's windows stop changing, and puts the real window in full screen.
 - **Force fn-F** makes fn-F switch native full screen in apps that ignore the shortcut. It is off by default.
 - The window lists the apps that will reopen in full screen. Select one and click the minus button to forget it.
 - Apps in the Ignored Apps list are never remembered or restored in full screen. Use the plus button, or select
@@ -46,9 +48,10 @@ FullscreenKeeper needs Accessibility access to see whether a window is in full s
 **Open Accessibility Settings...** in the window and allow **FullscreenKeeper** (it may show up as
 **fullscreenkeeperd**). Without it the agent does nothing.
 
-It only checks and sets the full-screen state of an app's windows; it doesn't read window titles or contents.
+It only checks and sets the full-screen state of an app's windows, and whether a window has any content at all
+when it picks which window to restore; it doesn't read window titles or contents.
 Force fn-F uses the same Accessibility permission and only watches the fn key, never other keys.
-All it stores is the name and bundle ID of each app in its two lists and your settings.
+All it stores is the name and bundle ID of each app in its lists and your settings. It keeps no logs.
 
 ## Updates
 
