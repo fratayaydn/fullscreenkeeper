@@ -488,6 +488,30 @@ private struct SettingsBackground: NSViewRepresentable {
     func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
 
+private struct EqualWidthColumns: Layout {
+    let spacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let gaps = spacing * CGFloat(subviews.count - 1)
+        let idealWidth = subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? idealWidth * CGFloat(subviews.count) + gaps
+        let column = ProposedViewSize(width: max(0, width - gaps) / CGFloat(subviews.count), height: proposal.height)
+        let height = subviews.map { $0.sizeThatFits(column).height }.max() ?? 0
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {
+        guard !subviews.isEmpty else { return }
+        let width = max(0, bounds.width - spacing * CGFloat(subviews.count - 1)) / CGFloat(subviews.count)
+        let column = ProposedViewSize(width: width, height: bounds.height)
+        for (index, subview) in subviews.enumerated() {
+            subview.place(at: CGPoint(x: bounds.minX + CGFloat(index) * (width + spacing), y: bounds.minY),
+                          anchor: .topLeading, proposal: column)
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = Model()
     @State private var selectedApps: Set<String> = []
@@ -530,7 +554,7 @@ struct ContentView: View {
             // The stack supplies the section gap instead of the Form's bottom margin.
             .padding(.bottom, -20)
 
-            HStack(alignment: .top, spacing: 16) {
+            EqualWidthColumns(spacing: 16) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Apps That Reopen in Full Screen")
                         .font(.headline)
@@ -553,7 +577,6 @@ struct ContentView: View {
                         selectedApps.removeAll()
                     }
                 }
-                .frame(maxWidth: .infinity)
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Ignored Apps")
                         .help("Never remembered or restored in full screen. Force fn-F still works in these apps.")
@@ -568,7 +591,6 @@ struct ContentView: View {
                         selectedIgnoredApps.removeAll()
                     }
                 }
-                .frame(maxWidth: .infinity)
             }
             .padding(10)
             .background {

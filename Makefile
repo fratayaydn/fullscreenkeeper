@@ -149,11 +149,19 @@ $(BUILD)/fullscreenkeeperd-release-check: $(AGENT_SRC) $(POLICY_HEADER) Makefile
 	mkdir -p $(BUILD)
 	clang $(CFLAGS) -UFULLSCREENKEEPER_DIAGNOSTIC_LOG -framework Foundation -framework AppKit -framework ApplicationServices -framework IOKit -framework Security $(AGENT_SRC) -o $@
 
-release-log-check: $(BUILD)/fullscreenkeeperd-release-check
+$(BUILD)/FullscreenKeeper-release-check: $(APP_SRC) Makefile
+	mkdir -p $(BUILD)/module-cache
+	swiftc -O -warnings-as-errors -module-cache-path $(BUILD)/module-cache -swift-version 5 -parse-as-library -target $(ARCH)-apple-macos$(MIN_OS) \
+		$(APP_SRC) -o $@
+
+release-log-check: $(BUILD)/fullscreenkeeperd-release-check $(BUILD)/FullscreenKeeper-release-check
 	@nm -u $< > $(BUILD)/release-symbols
 	@strings $< > $(BUILD)/release-strings
 	@if LC_ALL=C grep -E 'os_log|_os_log_impl|NSLog|os_log_create' $(BUILD)/release-symbols $(BUILD)/release-strings; then echo "Release agent contains logging references."; exit 1; fi
 	@echo "Passed release logging check: no os_log or NSLog references."
+	@nm -u $(BUILD)/FullscreenKeeper-release-check > $(BUILD)/app-release-symbols
+	@if LC_ALL=C grep -E 'os_log|runtimeIssues|NSLog' $(BUILD)/app-release-symbols; then echo "Release app contains logging references."; exit 1; fi
+	@echo "Passed release app logging check: no os_log, runtimeIssues or NSLog references."
 
 $(BUILD)/fullscreenkeeperd-diagnostic-check: $(AGENT_SRC) $(POLICY_HEADER) Makefile
 	mkdir -p $(BUILD)
