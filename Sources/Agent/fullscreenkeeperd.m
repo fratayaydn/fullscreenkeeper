@@ -1310,7 +1310,7 @@ static void unregisterLoginItem(void) {
     for (NSString *plist in @[UPDATER_PLIST, AGENT_PLIST]) {
         NSError *error = nil;
         if (![[NSClassFromString(@"SMAppService") agentServiceWithPlistName:plist] unregisterAndReturnError:&error])
-            fprintf(stderr, "fullscreenkeeperd: could not remove %s: %s\n", plist.UTF8String, error.localizedDescription.UTF8String);
+            DIAG(@"fullscreenkeeperd: could not remove %@: %@", plist, error.localizedDescription);
     }
 }
 
@@ -1324,11 +1324,11 @@ static void appMoved(void) {
         sleep(1);
         struct stat st;
         if (stat(gExecutable, &st) == 0) {
-            fprintf(stderr, "fullscreenkeeperd: FullscreenKeeper.app was updated, restarting\n");
+            DIAG(@"fullscreenkeeperd: FullscreenKeeper.app was updated, restarting");
             exit(1);
         }
     }
-    fprintf(stderr, "fullscreenkeeperd: FullscreenKeeper.app was removed, exiting\n");
+    DIAG(@"fullscreenkeeperd: FullscreenKeeper.app was removed, exiting");
     unregisterLoginItem();  // launchd may stop us right here
     exit(0);
 }

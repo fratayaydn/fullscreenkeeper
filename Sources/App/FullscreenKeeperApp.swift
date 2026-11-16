@@ -90,6 +90,7 @@ let agentJob = "gui/\(getuid())/io.github.fratayaydn.fullscreenkeeper.agent"
 let settingsChangedNotification = Notification.Name("io.github.fratayaydn.fullscreenkeeper.SettingsChanged")
 let statusChangedNotification = Notification.Name("io.github.fratayaydn.fullscreenkeeper.StatusChanged")
 let registeredBuildKey = "RegisteredBuildID"
+let reregistrationPendingKey = "ReregistrationPending"
 let currentBuildID = Bundle.main.object(forInfoDictionaryKey: "FKBuildID") as? String ?? ""
 let rememberedAppsType = UTType(exportedAs: "io.github.fratayaydn.fullscreenkeeper.remembered-apps", conformingTo: .data)
 
@@ -114,11 +115,24 @@ struct FeatureSettings {
     }
 }
 
+enum ReregistrationAction {
+    case none, storeID, runSequence
+}
+
+func reregistrationAction(storedBuildID: String?, currentBuildID: String, pending: Bool,
+                          wasEnabled: Bool, agentEnabled: Bool, registersAgent: Bool) -> ReregistrationAction {
+    if pending { return registersAgent ? .runSequence : .none }
+    guard storedBuildID != currentBuildID else { return .none }
+    return wasEnabled && agentEnabled && registersAgent ? .runSequence : .storeID
+}
+
 // Permission checks run in the agent executable so macOS uses the agent's identity and fresh process state.
 struct AgentPermissions {
     var accessibility = false
+    private var checked = false
+    private var restartedStaleTrust = false
 
-    mutating func check(run: (String) throws -> Int32) throws -> Bool {
+    mutating func check(agentAccessibility: Bool? = nil, run: (String) throws -> Int32) throws -> Bool {
         func granted(_ argument: String, name: String) throws -> Bool {
             let status = try run(argument)
             guard status == 0 || status == 1 else {
@@ -128,8 +142,11 @@ struct AgentPermissions {
             return status == 0
         }
         let newAccessibility = try granted("--check", name: "Accessibility")
-        let restart = !accessibility && newAccessibility
+        let staleTrust = newAccessibility && agentAccessibility == false && !restartedStaleTrust
+        let restart = newAccessibility && checked && !accessibility || staleTrust
+        if staleTrust { restartedStaleTrust = true }
         accessibility = newAccessibility
+        checked = true
         return restart
     }
 }
@@ -192,6 +209,9 @@ final class Model: ObservableObject {
         ) { [weak self] note in
             guard let self, note.object as? String == self.statusRequestID else { return }
             self.fnWatchActive = note.userInfo?["fnFWatch"] as? Bool
+            if note.userInfo?["accessibility"] as? Bool == false {
+                self.checkPermissionAgain(agentAccessibility: false)
+            }
         }
         refresh()
         let wasEnabled = agentStatus == .enabled
@@ -357,6 +377,7 @@ final class Model: ObservableObject {
 
     private func setFeature(_ on: Bool, key: String) {
         defaults.set(on, forKey: key)
+        defaults.removeObject(forKey: reregistrationPendingKey)
         defaults.synchronize()
         // Let a running agent tear down the feature before unregistering the jobs if both are off.
         DistributedNotificationCenter.default().postNotificationName(settingsChangedNotification, object: nil, deliverImmediately: true)
@@ -437,11 +458,11 @@ final class Model: ObservableObject {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
-    func checkPermissionAgain() {
+    func checkPermissionAgain(agentAccessibility: Bool? = nil) {
         do {
-            let restart = try permissions.check(run: runAgentCommand)
+            let restart = try permissions.check(agentAccessibility: agentAccessibility, run: runAgentCommand)
             agentStatus = agent.status
-            // Restart once when Accessibility becomes granted.
+            // Restart for a grant transition or a running agent with stale trust.
             if restart && agentStatus == .enabled {
                 DispatchQueue.global().async { launchctl(["kickstart", "-k", agentJob]) }
             }
@@ -463,12 +484,32 @@ final class Model: ObservableObject {
 
     // Local signing pins launchd to a build, so refresh its launch constraint after an update.
     private func reregisterAfterUpdate(wasEnabled: Bool) {
-        guard defaults.string(forKey: registeredBuildKey) != currentBuildID else { return }
-        defaults.set(currentBuildID, forKey: registeredBuildKey)
-        guard wasEnabled, FeatureSettings(defaults: defaults).registersAgent, agent.status == .enabled else { return }
-        DispatchQueue.global().async { [weak self] in
+        let pending = defaults.bool(forKey: reregistrationPendingKey)
+        let registersAgent = FeatureSettings(defaults: defaults).registersAgent
+        let action = reregistrationAction(storedBuildID: defaults.string(forKey: registeredBuildKey),
+            currentBuildID: currentBuildID, pending: pending, wasEnabled: wasEnabled,
+            agentEnabled: agent.status == .enabled, registersAgent: registersAgent)
+        if pending && !registersAgent {
+            defaults.removeObject(forKey: reregistrationPendingKey)
+            defaults.synchronize()
+        }
+        switch action {
+        case .none: return
+        case .storeID:
+            defaults.set(currentBuildID, forKey: registeredBuildKey)
+            return
+        case .runSequence: break
+        }
+        defaults.set(true, forKey: reregistrationPendingKey)
+        defaults.synchronize()
+        DispatchQueue.global().async { [weak self, defaults] in
             reregisterAgent()
             if !agentIsRunning() { reregisterAgent() }
+            if FeatureSettings(defaults: defaults).registersAgent {
+                defaults.set(currentBuildID, forKey: registeredBuildKey)
+            }
+            defaults.removeObject(forKey: reregistrationPendingKey)
+            defaults.synchronize()
             DispatchQueue.main.async { self?.refresh() }
         }
     }
@@ -544,7 +585,7 @@ struct ContentView: View {
                     if model.reopenInFullScreen, let path = model.spaceEventsPath, path != "windowserver transitions" {
                         StatusRow(symbol: "exclamationmark.triangle.fill", color: .yellow,
                                   title: "Running in compatibility mode.",
-                                  detail: "A macOS update changed something FullscreenKeeper uses; it still works, an update will restore the lighter mode.")
+                                  detail: "A macOS update changed something FullscreenKeeper uses; it still works.")
                     }
                 }
             }
@@ -616,7 +657,7 @@ struct ContentView: View {
                         Button(model.checkingUpdates ? "Checking..." : "Check Now") { model.checkUpdates() }
                             .disabled(model.checkingUpdates)
                     }
-                    if !model.automaticUpdates, let version = model.availableVersion {
+                    if let version = model.availableVersion {
                         Button("Install \(version)") { model.checkUpdates(install: true) }
                             .disabled(model.checkingUpdates)
                     }
@@ -843,7 +884,10 @@ func agentIsRunning() -> Bool { launchctl(["print", agentJob]).contains("state =
 func reregisterAgent() {
     try? setLoginItemsEnabled(false)
     for job in [updaterJob, agentJob] {
-        for _ in 0..<70 where !launchctl(["print", job]).isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        for _ in 0..<70 {
+            if launchctl(["print", job]).isEmpty { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
     }
     Thread.sleep(forTimeInterval: 1)
     guard FeatureSettings(defaults: .standard).registersAgent else { return }
@@ -871,6 +915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 startAgentOnce()
                 // This build is registered now; the window must not re-register it again (see reregisterAfterUpdate).
                 UserDefaults.standard.set(currentBuildID, forKey: registeredBuildKey)
+                UserDefaults.standard.removeObject(forKey: reregistrationPendingKey)
                 UserDefaults.standard.synchronize()  // exit() would otherwise drop the unsaved value
                 exit(0)
             } catch {

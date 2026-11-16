@@ -30,16 +30,16 @@ The two toggles work independently. Use either one on its own, or both together.
 
 ## Resource use
 
-The agent uses about 3.4 MB of memory. It has no timers and doesn't poll; it only wakes when WindowServer reports
-that a full-screen Space was created or closed, or when an app opens. Switching between desktops, full-screen apps
-or windows doesn't wake it. Over two minutes idle it used 0.4 ms of CPU and had no wakeups. Entering or leaving
-full screen costs about 0.7 ms of CPU.
+The agent uses about 3.4 MB of memory. It has no repeating timers and doesn't poll; restores use short one-shot
+timers. Otherwise it wakes when WindowServer reports that a full-screen Space was created or closed, or when an
+app opens or quits. Switching between desktops, full-screen apps or windows doesn't wake it. Over two minutes idle
+it used 0.4 ms of CPU and had no wakeups. Entering or leaving full screen costs about 0.7 ms of CPU.
 
-With Force fn-F on, the agent only wakes when fn is pressed.
+With Force fn-F on, pressing fn also wakes the agent.
 
 Measured on macOS 26.7.1: memory with `footprint`, CPU and wakeups with the kernel's `proc_pid_rusage` counters.
 
-The update check is a separate process that runs once a day and after a restart, for about 0.3 seconds, and then
+The update check is a separate process that runs once a day and at login if due, for about 0.3 seconds, and then
 exits. There is no menu bar icon, and the settings window only runs while it's open. The app is about 640 KB.
 
 ## Permissions
@@ -50,15 +50,16 @@ FullscreenKeeper needs Accessibility access to see whether a window is in full s
 
 It only checks and sets the full-screen state of an app's windows, and whether a window has any content at all
 when it picks which window to restore; it doesn't read window titles or contents.
-Force fn-F uses the same Accessibility permission and only watches the fn key, never other keys.
+Force fn-F uses the same Accessibility permission. While fn is held and for up to about a second after release,
+the agent also receives key presses to check for F. It reads only the key code and stores nothing.
 All it stores is the name and bundle ID of each app in its lists and your settings. It keeps no logs.
 
 ## Updates
 
-Once a day, and after a restart, FullscreenKeeper asks GitHub for the latest release and installs it if it's
-newer. An update is only installed when it's signed with the same Developer ID and notarized by Apple. The disk
-image is checked before it's opened, and the app inside is checked again before it replaces the old one. The check
-also runs at the first login after a macOS update, in case a fix for that version is already out.
+Once a day, FullscreenKeeper asks GitHub for the latest release and installs it if it's newer. At login, it checks
+only if about 20 hours have passed since the last check, or if macOS was updated, in case a fix for that version is
+already out. An update is only installed when it's signed with the same Developer ID and notarized by Apple. The
+disk image is checked before it's opened, and the app inside is checked again before it replaces the old one.
 
 The check is one request to `api.github.com` that sends only the app name and version. macOS asks once whether
 FullscreenKeeper may show a notification after an update; you can change that later in **System Settings >

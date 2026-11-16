@@ -68,15 +68,63 @@ private func featureSettings() throws {
         + "approval states, unchanged jobs, registration requests and errors.")
 }
 
+private func updateRegistration() {
+    for stored in [nil, "old", "current"] as [String?] {
+        for pending in [false, true] {
+            for wasEnabled in [false, true] {
+                for enabled in [false, true] {
+                    for registers in [false, true] {
+                        let action = reregistrationAction(storedBuildID: stored, currentBuildID: "current",
+                            pending: pending, wasEnabled: wasEnabled, agentEnabled: enabled,
+                            registersAgent: registers)
+                        if pending {
+                            precondition(action == (registers ? .runSequence : .none))
+                        } else if stored == "current" {
+                            precondition(action == .none)
+                        } else {
+                            precondition(action == (wasEnabled && enabled && registers ? .runSequence : .storeID))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    print("Passed update registration checks: interrupted sequences, matching and changed builds, "
+        + "initial registration, disabled agents and disabled features.")
+}
+
 private func agentPermissions() throws {
     var permissions = AgentPermissions()
     var calls: [String] = []
     let check: (String) -> Int32 = { calls.append($0); return 0 }
     let restarted = try permissions.check(run: check)
-    precondition(restarted && permissions.accessibility && calls == ["--check"])
+    precondition(!restarted && permissions.accessibility && calls == ["--check"])
     calls = []
     let unchanged = try permissions.check(run: check)
     precondition(!unchanged && calls == ["--check"])
+    var trusted = AgentPermissions()
+    let workingAgent = try trusted.check(agentAccessibility: true, run: check)
+    precondition(!workingAgent && trusted.accessibility)
+    var stale = AgentPermissions()
+    let staleAgent = try stale.check(agentAccessibility: false, run: check)
+    precondition(staleAgent && stale.accessibility)
+    for _ in 0..<3 {
+        let repeatedReply = try stale.check(agentAccessibility: false, run: check)
+        precondition(!repeatedReply && stale.accessibility, "Stale trust must restart only once per launch")
+    }
+    let staleDenied = try stale.check(agentAccessibility: false) { _ in 1 }
+    precondition(!staleDenied && !stale.accessibility)
+    let staleGranted = try stale.check(agentAccessibility: false, run: check)
+    precondition(staleGranted && stale.accessibility)
+    let afterGrant = try stale.check(agentAccessibility: false, run: check)
+    precondition(!afterGrant && stale.accessibility)
+    var delayed = AgentPermissions()
+    _ = try delayed.check(run: check)
+    let delayedReply = try delayed.check(agentAccessibility: false, run: check)
+    precondition(delayedReply)
+    var untrusted = AgentPermissions()
+    let stillDenied = try untrusted.check(agentAccessibility: false) { _ in 1 }
+    precondition(!stillDenied && !untrusted.accessibility)
     let denied = try permissions.check { argument in
         precondition(argument == "--check")
         return 1
@@ -97,8 +145,8 @@ private func agentPermissions() throws {
     } catch {
         precondition((error as NSError) == testError && permissions.accessibility)
     }
-    print("Passed agent permission checks: fresh Accessibility command, grant transitions restart once, "
-        + "revocation and errors.")
+    print("Passed agent permission checks: fresh Accessibility command, first checks, trusted and stale agents, "
+        + "delayed status replies, grant transitions, revocation and errors.")
 }
 
 @main
@@ -107,6 +155,7 @@ enum NotificationTests {
     static func main() throws {
         precondition(NSApp == nil)
         try featureSettings()
+        updateRegistration()
         try agentPermissions()
         let installed = ["--notify-update", "1.2.3", "--installed"]
         let available = ["--notify-update", "1.2.3", "--available"]

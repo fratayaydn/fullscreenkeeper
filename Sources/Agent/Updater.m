@@ -374,11 +374,11 @@ int updaterRun(BOOL force, BOOL install) {
             return 0;
         }
         BOOL automatic = install || preferenceEnabled(@"AutomaticallyInstallUpdates");
-        if (automatic && !installRelease(session, release, version, current, installed)) return 1;
+        BOOL installedUpdate = automatic && installRelease(session, release, version, current, installed);
         // Resolve the main executable at the installed path after the swap, so the new app sends the notification.
         NSString *notifier = [installed URLByAppendingPathComponent:@"Contents/MacOS/FullscreenKeeper"].path;
-        runTool(notifier, @[@"--notify-update", version, automatic ? @"--installed" : @"--available"], 60);
-        return 0;
+        runTool(notifier, @[@"--notify-update", version, installedUpdate ? @"--installed" : @"--available"], 60);
+        return automatic && !installedUpdate ? 1 : 0;
     } @finally {
         [session invalidateAndCancel];
         flock(lock, LOCK_UN);
