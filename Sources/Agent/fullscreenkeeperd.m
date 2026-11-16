@@ -443,8 +443,8 @@ static void saveApplications(NSDictionary *records) {
     [[NSDistributedNotificationCenter defaultCenter] postNotificationName:StatusChanged object:nil userInfo:nil deliverImmediately:YES];
 }
 
-// Status commands only read preferences. The running agent uses loadSettings to reconcile features too.
-static void readSettings(void) {
+// Status commands only read preferences. The running agent also persists migrations and reconciles features.
+static void readSettings(BOOL saveChanges) {
     for (NSNumber *pid in gProtected.allKeys)
         if (gProtected[pid].terminated) [gProtected removeObjectForKey:pid];
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
@@ -479,9 +479,12 @@ static void readSettings(void) {
     }
     if (![settleRecords isEqual:gSettleApplications]) {
         gSettleApplications = settleRecords;
-        CFPreferencesSetAppValue(KEY_SETTLE_APPLICATIONS, (__bridge CFDictionaryRef)settleRecords, PREFS_DOMAIN);
+        if (saveChanges) CFPreferencesSetAppValue(KEY_SETTLE_APPLICATIONS, (__bridge CFDictionaryRef)settleRecords, PREFS_DOMAIN);
     }
-    if (![records isEqual:gApplications]) saveApplications(records);
+    if (![records isEqual:gApplications]) {
+        if (saveChanges) saveApplications(records);
+        else gApplications = records;
+    }
 }
 
 static WindowState remembered(NSString *bundleID) {
@@ -905,9 +908,10 @@ static void finishRestore(RestoreSession *session, BOOL succeeded, const char *r
 }
 
 static void saveRestoreSettling(RestoreSession *session) {
-    readSettings();
+    readSettings(YES);
     NSString *bundleID = session->app.bundleIdentifier;
-    if (ignored(bundleID) || builtInSettling(bundleID) || [gSettleApplications[bundleID] isKindOfClass:[NSDictionary class]]) return;
+    if (session->app.terminated || ignored(bundleID) || builtInSettling(bundleID) ||
+        [gSettleApplications[bundleID] isKindOfClass:[NSDictionary class]]) return;
     NSMutableDictionary *records = [gSettleApplications mutableCopy];
     records[bundleID] = @{ @"name": session->app.localizedName ?: bundleID };
     gSettleApplications = records;
@@ -1217,7 +1221,7 @@ static void publishSpaceEventsPath(void) {
 }
 
 static void loadSettings(void) {
-    readSettings();
+    readSettings(YES);
     // Starting reopen can record apps, which reloads preferences before merging saved entries.
     if (gApplyingSettings) return;
     gApplyingSettings = YES;
@@ -1240,7 +1244,7 @@ static void settingsChanged(void) {
 #pragma mark - Status
 
 static int printStatus(void) {
-    readSettings();
+    readSettings(NO);
     __block NSDictionary *reply = nil;
     NSString *request = NSUUID.UUID.UUIDString;
     NSDistributedNotificationCenter *center = NSDistributedNotificationCenter.defaultCenter;
@@ -1314,23 +1318,50 @@ static void unregisterLoginItem(void) {
     }
 }
 
-// FullscreenKeeper.app was moved to the Trash or replaced by an update. An update puts a new copy at the same path within
-// moments: exit with an error so launchd starts the new agent. Otherwise the app is gone: remove the login item and
-// exit for good (a successful exit is not restarted).
+typedef enum { BundleRestart, BundleKeepRunning, BundleRemoveAndExit } BundleMoveAction;
+
+static BundleMoveAction bundleMoveAction(BOOL oldPathRestored, NSString *currentBundlePath) {
+    if (oldPathRestored) return BundleRestart;
+    if (!currentBundlePath.length) return BundleRemoveAndExit;
+    for (NSString *component in currentBundlePath.pathComponents)
+        if ([component isEqualToString:@".Trash"] || [component isEqualToString:@".Trashes"]) return BundleRemoveAndExit;
+    return BundleKeepRunning;
+}
+
+// An update restores the old path within moments. Otherwise keep watching a moved bundle, or remove
+// the login items if the bundle is gone or in the Trash. A successful exit is not restarted.
 static void appMoved(void) {
     stopFnFTaps();
-    dispatch_source_cancel(gBundleWatch);
+    BOOL restored = NO;
     for (int i = 0; i < 10; i++) {
         sleep(1);
         struct stat st;
         if (stat(gExecutable, &st) == 0) {
-            DIAG(@"fullscreenkeeperd: FullscreenKeeper.app was updated, restarting");
-            exit(1);
+            restored = YES;
+            break;
         }
     }
-    DIAG(@"fullscreenkeeperd: FullscreenKeeper.app was removed, exiting");
-    unregisterLoginItem();  // launchd may stop us right here
-    exit(0);
+    char path[PATH_MAX];
+    struct stat st;
+    NSString *bundlePath = fcntl((int)dispatch_source_get_handle(gBundleWatch), F_GETPATH, path) == 0 &&
+                           stat(path, &st) == 0 ? @(path) : nil;
+    BundleMoveAction action = bundleMoveAction(restored, bundlePath);
+    if (action == BundleKeepRunning) {
+        strlcpy(gExecutable, [bundlePath stringByAppendingPathComponent:@"Contents/MacOS/fullscreenkeeperd"].fileSystemRepresentation,
+                sizeof(gExecutable));
+        updateFnFTaps();
+        // The vnode source follows the open bundle descriptor across renames, including a later Trash move.
+        return;
+    }
+    dispatch_source_cancel(gBundleWatch);
+    if (action == BundleRestart) {
+        DIAG(@"fullscreenkeeperd: FullscreenKeeper.app was updated, restarting");
+        exit(1);
+    } else {
+        DIAG(@"fullscreenkeeperd: FullscreenKeeper.app was removed, exiting");
+        unregisterLoginItem();  // launchd may stop us right here
+        exit(0);
+    }
 }
 
 // Watch the app bundle through the kernel's event queue: no polling, no wakeups until it moves.

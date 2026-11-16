@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <math.h>
+#include <unistd.h>
 
 static double testUptime;
 static BOOL useTestUptime;
@@ -103,6 +104,7 @@ static TestDistributedCenter *distributedCenter;
 static BOOL childLaunches;
 static int childStatus, restartStatus;
 static unsigned childChecks;
+static unsigned loginItemRemovals, bundleWaits;
 static NSTaskTerminationReason childReason;
 @implementation TestTask
 - (BOOL)launchAndReturnError:(NSError **)error {
@@ -212,6 +214,11 @@ static void testPortOptions(CFMachPortRef port, int options) {
     portOptions++;
 }
 static void *testDlopen(const char *path, int flags) {
+    if (!strcmp(path, "/System/Library/Frameworks/ServiceManagement.framework/ServiceManagement")) {
+        assert(flags == RTLD_NOW);
+        loginItemRemovals++;
+        return NULL;
+    }
     assert(flags == (RTLD_NOW | RTLD_LOCAL));
     libraryLoads++;
     if (!privateAPIAvailable) return NULL;
@@ -483,6 +490,13 @@ static void testAsync(dispatch_queue_t queue, dispatch_block_t block) {
     else block();
 }
 static void testExit(int status) { restartStatus = status; }
+static unsigned testSleep(unsigned seconds) {
+    assert(seconds == 1);
+    assert(!keyTapEnabled && !hidOpen && !hidScheduled);
+    assert(tapInvalidations == tapCreations && tapSourceRemovals == tapSourceCreations);
+    bundleWaits++;
+    return 0;
+}
 
 #define NSRunningApplication TestApplication
 #define NSProcessInfo TestProcessInfo
@@ -536,6 +550,7 @@ static void testExit(int status) { restartStatus = status; }
 #define IOHIDElementGetUsage testHIDUsage
 #define IOHIDValueGetIntegerValue testHIDInput
 #define exit testExit
+#define sleep testSleep
 static BOOL debugLogging;
 #define FULLSCREENKEEPER_DIAGNOSTIC_LOG
 #import "../Sources/Agent/DiagnosticLog.h"
@@ -627,6 +642,7 @@ static void reset(void) {
     childReason = NSTaskTerminationReasonExit;
     restartStatus = -1;
     childChecks = 0;
+    loginItemRemovals = bundleWaits = 0;
     privateAPIAvailable = failCoreFoundation = failMachPort = failRunLoopSource = nullEventPort = NO;
     missingSymbol = NULL;
     registrationError = eventPortError = kCGErrorSuccess;
@@ -749,7 +765,7 @@ static void legacySettingsCleanup(void) {
     assert(remembered(@"test.old.windowed") == StateWindowed);
     assert(remembered(@"test.absent") == StateWindowed);
     loadSettings();
-    readSettings();
+    readSettings(YES);
     saveState(kept, StateFullscreen);
     assert([preferences[kept.bundleIdentifier] isEqual:entry]);
     assert(saves == 2 && settleSaves == 1);  // migration writes each changed key once
@@ -923,6 +939,37 @@ static void statusUsesAgentReply(void) {
     };
     char *arguments[] = { "fullscreenkeeperd", NULL };
     assert(agentMain(1, arguments) == 0 && replies == 1);
+}
+
+static void statusDoesNotMigrateSettings(void) {
+    for (unsigned disabled = 0; disabled < 2; disabled++) {
+        reset();
+        reopenPreference = @(!disabled);
+        preferences = @{
+            @"test.legacy": @{ @"fullscreen": @YES, @"settle": @YES },
+            @"test.windowed": @{ @"fullscreen": @NO },
+            @"test.ignored": @{ @"fullscreen": @YES },
+            @"test.invalid": @YES
+        };
+        ignoredPreferences = @{ @"test.ignored": @{} };
+        NSDictionary *before = preferences;
+        NSDictionary *flags = settlePreferences;
+        __block unsigned notifications = 0;
+        id token = [distributedCenter addObserverForName:StatusChanged object:nil queue:nil
+            usingBlock:^(NSNotification *note) { (void)note; notifications++; }];
+        NSString *output = statusOutput(@{});
+        assert(!saves && !settleSaves && !notifications);
+        assert([preferences isEqual:before] && [settlePreferences isEqual:flags]);
+        assert(!spaceEventsPreference && !trustChecks && !axCalls && !inputChecks);
+        assert([output containsString:@"test.legacy"]);
+        assert([output containsString:@"test.windowed"] == disabled);
+        assert([output containsString:@"test.ignored"] == disabled);
+        [distributedCenter removeObserver:token];
+        loadSettings();
+        assert(saves == 2 && settleSaves == 1);
+        assert(!preferences[@"test.legacy"][@"settle"] && settlePreferences[@"test.legacy"]);
+        assert((preferences[@"test.windowed"] != nil) == disabled);
+    }
 }
 
 static void settingsDuringStartup(void) {
@@ -2258,7 +2305,7 @@ static void settlingMigration(void) {
         assert((preferences[@"test.windowed"] != nil) == disabled);
         assert((preferences[@"test.ignored"] != nil) == disabled);
         loadSettings();
-        readSettings();
+        readSettings(YES);
         assert(saves == 2 && settleSaves == 1);
     }
 }
@@ -2344,6 +2391,27 @@ static void terminatedRestoreSteps(void) {
         }
         assert(app.terminated && !gRestores.count && !gProtected.count && !gActivationObserver);
         assert(writes == (step == 2 || step == 4 ? 1u : 0u) && saves == 0 && trustChecks == 0);
+        assert(remembered(app.bundleIdentifier) == StateFullscreen);
+    }
+}
+
+static void terminatedRestoreDoesNotLearnSettling(void) {
+    for (unsigned step = 0; step < 3; step++) {
+        reset();
+        useTestUptime = YES;
+        TestApplication *app = application(106, YES);
+        workspace.frontmostApplication = app;
+        startRestore(app);
+        RestoreSession *session = gRestores[@106];
+        assert(writes == 1 && session->readBack);
+        recordFullscreenSpace(1327, 42, app);
+        if (step == 2) preferenceReadHook = ^{ app.terminated = YES; };
+        else app.terminated = YES;
+        if (step == 1)
+            [workspace.notificationCenter postNotificationName:NSWorkspaceDidTerminateApplicationNotification object:nil
+                                                     userInfo:@{ NSWorkspaceApplicationKey: app }];
+        recordFullscreenSpace(1328, 42, app);
+        assert(app.terminated && !saves && !settleSaves && !settlePreferences[app.bundleIdentifier]);
         assert(remembered(app.bundleIdentifier) == StateFullscreen);
     }
 }
@@ -2788,6 +2856,63 @@ static void updaterCommands(void) {
     assert(!trustChecks && !axCalls && !saves && !applicationCreations && !libraryLoads);
 }
 
+static void bundleMoveDecisions(void) {
+    for (NSArray *test in @[
+        @[NSNull.null, @(BundleRemoveAndExit)], @[@"", @(BundleRemoveAndExit)],
+        @[@"/Applications/Utilities/FullscreenKeeper.app", @(BundleKeepRunning)],
+        @[@"/Applications/Renamed.app", @(BundleKeepRunning)],
+        @[@"/Users/test/.Trash/FullscreenKeeper.app", @(BundleRemoveAndExit)],
+        @[@"/Volumes/Disk/.Trashes/501/FullscreenKeeper.app", @(BundleRemoveAndExit)],
+        @[@"/.Trash", @(BundleRemoveAndExit)], @[@"/.Trashes", @(BundleRemoveAndExit)],
+        @[@"/Applications/.TrashTools/FullscreenKeeper.app", @(BundleKeepRunning)],
+        @[@"/Applications/Trash/FullscreenKeeper.app", @(BundleKeepRunning)]
+    ]) {
+        NSString *path = test[0] == NSNull.null ? nil : test[0];
+        assert(bundleMoveAction(YES, path) == BundleRestart);
+        assert(bundleMoveAction(NO, path) == [test[1] unsignedIntValue]);
+    }
+}
+
+static void movedBundleKeepsWatch(void) {
+    reset();
+    forceFnFPreference = @YES;
+    loadSettings();
+    setFnFTapEnabled(gFnFKeyTap, &gFnFKeyTapEnabled, YES);
+    assert(keyTapEnabled && hidOpen && tapCreations == 1 && hidCreations == 1);
+    NSFileManager *files = NSFileManager.defaultManager;
+    char temporary[] = "/private/tmp/fullscreenkeeper-bundle-XXXXXX";
+    assert(mkdtemp(temporary));
+    NSString *root = @(temporary);
+    NSString *original = [root stringByAppendingPathComponent:@"FullscreenKeeper.app"];
+    NSString *moved = [root stringByAppendingPathComponent:@"Utilities/Renamed.app"];
+    NSString *trashed = [root stringByAppendingPathComponent:@".Trash/Renamed.app"];
+    assert([files createDirectoryAtPath:original withIntermediateDirectories:YES attributes:nil error:NULL]);
+    assert([files createDirectoryAtPath:moved.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL]);
+    assert([files createDirectoryAtPath:trashed.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL]);
+    int fd = open(original.fileSystemRepresentation, O_EVTONLY);
+    assert(fd >= 0);
+    gBundleWatch = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, fd,
+        DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE, dispatch_get_main_queue());
+    dispatch_source_set_cancel_handler(gBundleWatch, ^{ close(fd); });
+    dispatch_resume(gBundleWatch);
+    dispatch_source_t watch = gBundleWatch;
+    strlcpy(gExecutable, [original stringByAppendingPathComponent:@"Contents/MacOS/fullscreenkeeperd"].fileSystemRepresentation,
+            sizeof(gExecutable));
+    assert([files moveItemAtPath:original toPath:moved error:NULL]);
+    appMoved();
+    assert(restartStatus == -1 && !loginItemRemovals && bundleWaits == 10);
+    assert(gBundleWatch == watch && !dispatch_source_testcancel(watch));
+    assert(gFnFHID && gFnFKeyTap && hidOpen && !keyTapEnabled);
+    assert(tapCreations == 2 && hidCreations == 2 && tapInvalidations == 1 && hidCloses == 1);
+    assert(!strcmp(gExecutable, [moved stringByAppendingPathComponent:@"Contents/MacOS/fullscreenkeeperd"].fileSystemRepresentation));
+    assert([files moveItemAtPath:moved toPath:trashed error:NULL]);
+    appMoved();
+    assert(restartStatus == 0 && loginItemRemovals == 1 && bundleWaits == 20);
+    assert(dispatch_source_testcancel(watch) && !gFnFHID && !gFnFKeyTap);
+    gBundleWatch = nil;
+    assert([files removeItemAtPath:root error:NULL]);
+}
+
 int main(void) {
     @autoreleasepool {
         updaterCommands();
@@ -2800,6 +2925,7 @@ int main(void) {
         startupObservers();
         settingsDuringStartup();
         statusUsesAgentReply();
+        statusDoesNotMigrateSettings();
         windowServerStartup();
         windowServerFallbacks();
         windowServerRegistrationFallbacks();
@@ -2831,6 +2957,7 @@ int main(void) {
         settlingTypeSafety();
         ignoredSettlingFlags();
         terminatedRestoreSteps();
+        terminatedRestoreDoesNotLearnSettling();
         ignoredSettingsCleanup();
         ignoredEventPaths();
         ignoringCancelsPendingWork();
@@ -2842,6 +2969,8 @@ int main(void) {
         fnFTimeoutRecovery();
         fnFReleaseOrder();
         fnFDeferredToggle();
+        bundleMoveDecisions();
+        movedBundleKeepsWatch();
         puts("Passed agent checks: built-in settling without preference writes, ignored built-in exclusion, empty-window deadline, settled target fallback, independent settling flags survive removal and re-adding, legacy flag migration, ignored flag exclusion, flag type safety, remembered settling flags, delayed flagged launches, no-window deadline, launch restore settling, main standard window selection, quiet wait resets, settling deadline, legacy settings cleanup, immediate exits remove entries, startup keeps entries, failed restores keep entries,");
         puts("cached trust, WindowServer startup without NSApplication, event draining and release, private API fallback failures, transition registration fallbacks and Space ID decoding,");
         puts("type 4 creation saves without AX, non-full-screen types ignored, event-time frontmost apps, per-Space ownership,");
@@ -2857,6 +2986,7 @@ int main(void) {
         puts("Updater command dispatch bypasses window and permission work; all three compatibility paths are saved.");
         puts("Force fn-F: permission gates, fn-only HID queues, creation failures, cached targets, deferred toggles, repeats, keyUp, release order, release timeout, tap recovery and cleanup.");
         puts("Startup settings notifications reconcile both features after initialization; repeated preference reads are idempotent; status replies report live tap state; status output uses agent permissions and features or unknown.");
+        puts("Status preserves preferences without StatusChanged notifications; terminated restores do not learn settling; bundle move decisions preserve login items and watches until Trash removal.");
     }
     return 0;
 }
