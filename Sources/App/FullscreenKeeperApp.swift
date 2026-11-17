@@ -126,6 +126,11 @@ func reregistrationAction(storedBuildID: String?, currentBuildID: String, pendin
     return wasEnabled && agentEnabled && registersAgent ? .runSequence : .storeID
 }
 
+func shouldRelaunchAfterUpdate(runningVersion: String, diskVersion: String?) -> Bool {
+    guard let diskVersion else { return false }
+    return diskVersion != runningVersion
+}
+
 // Permission checks run in the agent executable so macOS uses the agent's identity and fresh process state.
 struct AgentPermissions {
     var accessibility = false
@@ -423,7 +428,9 @@ final class Model: ObservableObject {
     func checkUpdates(install: Bool = false) {
         guard !checkingUpdates else { return }
         checkingUpdates = true
-        let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/fullscreenkeeperd")
+        let bundleURL = Bundle.main.bundleURL
+        let runningVersion = version
+        let executable = bundleURL.appendingPathComponent("Contents/MacOS/fullscreenkeeperd")
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let process = Process()
             process.executableURL = executable
@@ -431,17 +438,35 @@ final class Model: ObservableObject {
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             var message: String?
+            var relaunch = false
             do {
                 try process.run()
                 process.waitUntilExit()
                 if process.terminationReason != .exit || process.terminationStatus != 0 {
                     message = "Could not complete the update. Try again later."
+                } else if let data = try? Data(contentsOf: bundleURL.appendingPathComponent("Contents/Info.plist")),
+                          let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+                          shouldRelaunchAfterUpdate(runningVersion: runningVersion,
+                                                   diskVersion: plist["CFBundleShortVersionString"] as? String) {
+                    let open = Process()
+                    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    open.arguments = ["-n", bundleURL.path]
+                    open.standardOutput = FileHandle.nullDevice
+                    open.standardError = FileHandle.nullDevice
+                    try open.run()
+                    open.waitUntilExit()
+                    relaunch = open.terminationReason == .exit && open.terminationStatus == 0
                 }
             } catch {
                 message = "Could not check for updates: \(error.localizedDescription)"
             }
             let result = message
+            let shouldQuit = relaunch
             DispatchQueue.main.async {
+                if shouldQuit {
+                    NSApp.terminate(nil)
+                    return
+                }
                 self?.checkingUpdates = false
                 self?.errorMessage = result
                 self?.refresh()

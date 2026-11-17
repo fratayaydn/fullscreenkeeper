@@ -33,10 +33,14 @@ static void scheduling(void) {
     assert(updaterCheckDue(now, now, @"25A1", @"25B2", YES, NO));
     assert(updaterCheckDue(now, now, nil, @"25B2", YES, NO));
     assert(!updaterCheckDue(nil, now, nil, @"25B2", NO, NO));
-    assert(!updaterCheckDue(nil, now, nil, @"25B2", NO, YES));
+    assert(updaterCheckDue(nil, now, nil, @"25B2", NO, YES));
+    assert(!updaterCheckDue(@"invalid", now, @"25A1", @"25A1", NO, NO));
+    assert(!updaterCheckDue([now dateByAddingTimeInterval:1], now, @"25A1", @"25A1", NO, NO));
+    assert(!updaterCheckDue([now dateByAddingTimeInterval:-21 * 3600], now, @"25A1", @"25A1", NO, NO));
     assert(!updaterCheckDue(now, now, @"25A1", @"25A1", NO, NO));
     assert(!updaterCheckDue(now, now, @"25A1", @"25B2", NO, NO));
-    assert(!updaterCheckDue(now, now, @"25A1", @"25B2", NO, YES));
+    assert(updaterCheckDue(now, now, @"25A1", @"25A1", NO, YES));
+    assert(updaterCheckDue(now, now, @"25A1", @"25B2", NO, YES));
 }
 
 static void assetSizes(void) {

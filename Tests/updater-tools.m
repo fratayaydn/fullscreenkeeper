@@ -92,6 +92,14 @@ static void updateNotifications(void) {
             writeToFile:notifier atomically:YES encoding:NSUTF8StringEncoding error:NULL]);
         assert(chmod(notifier.fileSystemRepresentation, 0700) == 0);
         NSString *arguments = [notifier stringByAppendingString:@".arguments"];
+        preferences = [@{@"AutomaticallyInstallUpdates": @NO} mutableCopy];
+        NSDictionary *saved = preferences.copy;
+        testRelease = @{@"tag_name": @"v1.2.3", @"draft": @NO, @"prerelease": @NO, @"assets": @[]};
+        releaseRequests = cancelledSessions = 0;
+        assert(updaterRun(NO, NO) == 0);
+        assert(releaseRequests == 0 && cancelledSessions == 0);
+        assert([preferences isEqual:saved]);
+        assert(![fm fileExistsAtPath:arguments]);
         for (NSNumber *automatic in @[@NO, @YES]) for (NSNumber *install in @[@NO, @YES]) {
             preferences = [@{@"AutomaticallyInstallUpdates": automatic} mutableCopy];
             testRelease = @{@"tag_name": @"v1.2.3", @"draft": @NO, @"prerelease": @NO, @"assets": @[]};

@@ -93,6 +93,15 @@ private func updateRegistration() {
         + "initial registration, disabled agents and disabled features.")
 }
 
+private func updateRelaunch() {
+    precondition(!shouldRelaunchAfterUpdate(runningVersion: "1.0.3", diskVersion: nil))
+    precondition(!shouldRelaunchAfterUpdate(runningVersion: "1.0.3", diskVersion: "1.0.3"))
+    precondition(shouldRelaunchAfterUpdate(runningVersion: "1.0.3", diskVersion: "1.0.4"),
+                 "A changed bundle version must relaunch the settings app")
+    precondition(shouldRelaunchAfterUpdate(runningVersion: "1.0.3", diskVersion: "1.0.2"))
+    print("Passed update relaunch checks: missing, equal, newer and older bundle versions.")
+}
+
 private func agentPermissions() throws {
     var permissions = AgentPermissions()
     var calls: [String] = []
@@ -156,6 +165,7 @@ enum NotificationTests {
         precondition(NSApp == nil)
         try featureSettings()
         updateRegistration()
+        updateRelaunch()
         try agentPermissions()
         let installed = ["--notify-update", "1.2.3", "--installed"]
         let available = ["--notify-update", "1.2.3", "--available"]

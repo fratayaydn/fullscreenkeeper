@@ -41,8 +41,9 @@ NSComparisonResult updaterCompareVersions(NSString *left, NSString *right) {
 }
 
 BOOL updaterCheckDue(id lastCheck, NSDate *now, id lastBuild, NSString *currentBuild, BOOL enabled, BOOL force) {
+    if (force) return YES;
     if (!enabled) return NO;
-    if (force || ![lastBuild isEqual:currentBuild]) return YES;
+    if (![lastBuild isEqual:currentBuild]) return YES;
     return ![lastCheck isKindOfClass:NSDate.class] || [now timeIntervalSinceDate:lastCheck] >= 20 * 60 * 60;
 }
 
@@ -328,8 +329,9 @@ int updaterRun(BOOL force, BOOL install) {
     char build[256] = {0};
     size_t size = sizeof(build);
     NSString *osBuild = sysctlbyname("kern.osversion", build, &size, NULL, 0) == 0 ? @(build) : nil;
-    if (!updaterCheckDue(preference(@"LastUpdateCheck"), NSDate.date, preference(@"LastUpdateCheckOSBuild"), osBuild,
-                         preferenceEnabled(@"AutomaticUpdateChecks"), force)) {
+    if (!preferenceEnabled(@"AutomaticUpdateChecks") ||
+        !updaterCheckDue(preference(@"LastUpdateCheck"), NSDate.date, preference(@"LastUpdateCheckOSBuild"), osBuild,
+                         preferenceEnabled(@"AutomaticallyInstallUpdates"), force)) {
         return 0;
     }
     if (!osBuild) { return 1; }
