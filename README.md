@@ -41,7 +41,7 @@ Measured on macOS 26.7.1: memory with `footprint`, CPU and wakeups with the kern
 
 With automatic installs on, the update check runs in a separate process once a day and at login if due, for about
 0.3 seconds, and then exits. There is no menu bar icon, and the settings window only runs while it's open. The app is
-about 640 KB.
+about 1.9 MB.
 
 ## Permissions
 
