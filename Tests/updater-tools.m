@@ -100,6 +100,17 @@ static void updateNotifications(void) {
         assert(releaseRequests == 0 && cancelledSessions == 0);
         assert([preferences isEqual:saved]);
         assert(![fm fileExistsAtPath:arguments]);
+        for (NSNumber *force in @[@NO, @YES]) for (NSNumber *install in @[@NO, @YES])
+            for (NSNumber *installedUpdate in @[@NO, @YES]) {
+                notifyUpdate([NSURL fileURLWithPath:bundle], @"1.2.3", installedUpdate.boolValue, force.boolValue, install.boolValue);
+                if (force.boolValue || install.boolValue) {
+                    assert(![fm fileExistsAtPath:arguments]);
+                } else {
+                    NSString *expected = installedUpdate.boolValue ? @"--notify-update\n1.2.3\n--installed\n" : @"--notify-update\n1.2.3\n--available\n";
+                    assert([[NSString stringWithContentsOfFile:arguments encoding:NSUTF8StringEncoding error:NULL] isEqual:expected]);
+                    assert([fm removeItemAtPath:arguments error:NULL]);
+                }
+            }
         for (NSNumber *automatic in @[@NO, @YES]) for (NSNumber *install in @[@NO, @YES]) {
             preferences = [@{@"AutomaticallyInstallUpdates": automatic} mutableCopy];
             testRelease = @{@"tag_name": @"v1.2.3", @"draft": @NO, @"prerelease": @NO, @"assets": @[]};
@@ -107,10 +118,13 @@ static void updateNotifications(void) {
             assert(updaterRun(YES, install.boolValue) == (automatic.boolValue || install.boolValue ? 1 : 0));
             assert(releaseRequests == 1 && cancelledSessions == 1);
             assert([preferences[@"LatestVersion"] isEqual:@"1.2.3"]);
-            assert([[NSString stringWithContentsOfFile:arguments encoding:NSUTF8StringEncoding error:NULL]
-                isEqual:@"--notify-update\n1.2.3\n--available\n"]);
-            assert([fm removeItemAtPath:arguments error:NULL]);
+            assert(![fm fileExistsAtPath:arguments]);
         }
+        preferences = [@{@"AutomaticallyInstallUpdates": @YES} mutableCopy];
+        assert(updaterRun(NO, NO) == 1);
+        assert([[NSString stringWithContentsOfFile:arguments encoding:NSUTF8StringEncoding error:NULL]
+            isEqual:@"--notify-update\n1.2.3\n--available\n"]);
+        assert([fm removeItemAtPath:arguments error:NULL]);
         for (NSString *version in @[@"1.0.0", @"0.9.0"]) {
             testRelease = @{@"tag_name": version, @"draft": @NO, @"prerelease": @NO};
             assert(updaterRun(YES, NO) == 0);
@@ -119,7 +133,7 @@ static void updateNotifications(void) {
     } @finally {
         assert([fm removeItemAtPath:bundle error:NULL]);
     }
-    puts("Passed updater notification checks: available updates, failed automatic and explicit installs, unchanged and older versions; no network or real install.");
+    puts("Passed updater notification checks: silent forced checks and explicit installs, scheduled installed and available updates, unchanged and older versions; no network or real install.");
 }
 
 int main(void) {

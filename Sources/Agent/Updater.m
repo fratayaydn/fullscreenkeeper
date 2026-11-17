@@ -324,6 +324,13 @@ static BOOL installRelease(NSURLSession *session, NSDictionary *release, NSStrin
     return success && clean;
 }
 
+static void notifyUpdate(NSURL *installed, NSString *version, BOOL installedUpdate, BOOL force, BOOL install) {
+    if (force || install) return;
+    // Resolve the main executable at the installed path after the swap, so the new app sends the notification.
+    NSString *notifier = [installed URLByAppendingPathComponent:@"Contents/MacOS/FullscreenKeeper"].path;
+    runTool(notifier, @[@"--notify-update", version, installedUpdate ? @"--installed" : @"--available"], 60);
+}
+
 int updaterRun(BOOL force, BOOL install) {
     CFPreferencesAppSynchronize((__bridge CFStringRef)BundleID);
     char build[256] = {0};
@@ -377,9 +384,7 @@ int updaterRun(BOOL force, BOOL install) {
         }
         BOOL automatic = install || preferenceEnabled(@"AutomaticallyInstallUpdates");
         BOOL installedUpdate = automatic && installRelease(session, release, version, current, installed);
-        // Resolve the main executable at the installed path after the swap, so the new app sends the notification.
-        NSString *notifier = [installed URLByAppendingPathComponent:@"Contents/MacOS/FullscreenKeeper"].path;
-        runTool(notifier, @[@"--notify-update", version, installedUpdate ? @"--installed" : @"--available"], 60);
+        notifyUpdate(installed, version, installedUpdate, force, install);
         return automatic && !installedUpdate ? 1 : 0;
     } @finally {
         [session invalidateAndCancel];
