@@ -597,6 +597,9 @@ static void recordSpaceApplication(NSRunningApplication *app, BOOL seriesAllowed
 
 static void recordSpaceChange(BOOL transition) {
     if (!gReopenInFullScreen) return;
+    for (NSNumber *pid in gLastSpaceChanges.allKeys)
+        if (![NSRunningApplication runningApplicationWithProcessIdentifier:pid.intValue])
+            [gLastSpaceChanges removeObjectForKey:pid];
     double changedAt = now();
     NSRunningApplication *app = NSWorkspace.sharedWorkspace.frontmostApplication;
     NSNumber *pid = @(app.processIdentifier);
@@ -705,6 +708,9 @@ static void seedFullscreenSpaces(void *skyLight) {
 
 static void recordFullscreenSpace(uint32_t type, uint64_t sid, NSRunningApplication *frontmost) {
     if (!gReopenInFullScreen) return;
+    for (NSNumber *pid in gLastSpaceChanges.allKeys)
+        if (![NSRunningApplication runningApplicationWithProcessIdentifier:pid.intValue])
+            [gLastSpaceChanges removeObjectForKey:pid];
     NSNumber *key = @(sid);
     if (type == 1327) {
         if (!gTrusted || !eligible(frontmost)) return;
