@@ -35,6 +35,10 @@ reregister() {
     sleep 2
 }
 
+TEMP=$(mktemp -d "$(dirname "$APP")/.FullscreenKeeper-install.XXXXXX")
+trap 'rm -rf "$TEMP"' EXIT
+cp -R "$BUILD" "$TEMP/FullscreenKeeper.app"
+
 pkill -x FullscreenKeeper || true
 enabled=no
 launchctl print "$JOB" >/dev/null 2>&1 && enabled=yes
@@ -44,7 +48,7 @@ if [ -x "$CLI" ]; then
 fi
 
 rm -rf "$APP"
-cp -R "$BUILD" "$APP"
+mv "$TEMP/FullscreenKeeper.app" "$APP"
 
 if [ "$enabled" = yes ]; then
     reregister
