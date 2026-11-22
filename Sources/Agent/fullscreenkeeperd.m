@@ -7,12 +7,14 @@
 #import <IOKit/hidsystem/IOHIDLib.h>
 #include <Carbon/Carbon.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #import "DiagnosticLog.h"
 #include <stdatomic.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include "Policy.h"
 #import "Updater.h"
@@ -436,6 +438,30 @@ static WindowState applicationState(NSRunningApplication *app, const char *phase
 
 #pragma mark - Settings and recording
 
+// Nested settings reloads share the outer lock. Reopen the file after bundle updates.
+static void withSettingsLock(BOOL needed, dispatch_block_t change) {
+    if (!needed) { change(); return; }
+    static unsigned depth;
+    static int fd = -1;
+    if (depth++ == 0) {
+        NSString *contents = [@(gExecutable) stringByDeletingLastPathComponent].stringByDeletingLastPathComponent;
+        fd = gExecutable[0] ? open([contents stringByAppendingPathComponent:@"Info.plist"].fileSystemRepresentation,
+                                   O_RDONLY | O_CLOEXEC) : -1;
+        if (fd >= 0) {
+            for (unsigned attempt = 0; flock(fd, LOCK_EX | LOCK_NB) != 0; attempt++) {
+                // Keep the key tap responsive if another process holds the lock.
+                if (errno != EWOULDBLOCK || attempt == 40) { close(fd); fd = -1; break; }
+                usleep(5000);
+            }
+        }
+    }
+    @try {
+        change();
+    } @finally {
+        if (--depth == 0 && fd >= 0) { close(fd); fd = -1; }
+    }
+}
+
 static void saveApplications(NSDictionary *records) {
     gApplications = records;
     CFPreferencesSetAppValue(KEY_APPLICATIONS, (__bridge CFDictionaryRef)records, PREFS_DOMAIN);
@@ -445,46 +471,48 @@ static void saveApplications(NSDictionary *records) {
 
 // Status commands only read preferences. The running agent also persists migrations and reconciles features.
 static void readSettings(BOOL saveChanges) {
-    for (NSNumber *pid in gProtected.allKeys)
-        if (gProtected[pid].terminated) [gProtected removeObjectForKey:pid];
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
-    id reopenValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_REOPEN_IN_FULL_SCREEN, PREFS_DOMAIN));
-    gReopenInFullScreen = ![reopenValue isKindOfClass:[NSNumber class]] || [reopenValue boolValue];
-    id forceValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_FORCE_FN_F, PREFS_DOMAIN));
-    gForceFnF = [forceValue isKindOfClass:[NSNumber class]] && [forceValue boolValue];
-    id ignoredValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_IGNORED_APPLICATIONS, PREFS_DOMAIN));
-    gIgnoredApplications = [ignoredValue isKindOfClass:[NSDictionary class]] ? ignoredValue : @{};
-    id value = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_APPLICATIONS, PREFS_DOMAIN));
-    gApplications = [value isKindOfClass:[NSDictionary class]] ? value : @{};
-    id settleValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_SETTLE_APPLICATIONS, PREFS_DOMAIN));
-    gSettleApplications = [settleValue isKindOfClass:[NSDictionary class]] ? settleValue : @{};
-    NSMutableDictionary *records = [gApplications mutableCopy];
-    NSMutableDictionary *settleRecords = [gSettleApplications mutableCopy];
-    for (NSString *bundleID in gApplications) {
-        id entry = gApplications[bundleID];
-        if ([entry isKindOfClass:[NSDictionary class]] && entry[@"settle"]) {
-            id settle = entry[@"settle"];
-            if (!ignored(bundleID) && [settle isKindOfClass:[NSNumber class]] && [settle boolValue] &&
-                ![settleRecords[bundleID] isKindOfClass:[NSDictionary class]]) {
-                id name = entry[@"name"];
-                settleRecords[bundleID] = @{ @"name": [name isKindOfClass:[NSString class]] ? name : bundleID };
+    withSettingsLock(saveChanges, ^{
+        for (NSNumber *pid in gProtected.allKeys)
+            if (gProtected[pid].terminated) [gProtected removeObjectForKey:pid];
+        CFPreferencesAppSynchronize(PREFS_DOMAIN);
+        id reopenValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_REOPEN_IN_FULL_SCREEN, PREFS_DOMAIN));
+        gReopenInFullScreen = ![reopenValue isKindOfClass:[NSNumber class]] || [reopenValue boolValue];
+        id forceValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_FORCE_FN_F, PREFS_DOMAIN));
+        gForceFnF = [forceValue isKindOfClass:[NSNumber class]] && [forceValue boolValue];
+        id ignoredValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_IGNORED_APPLICATIONS, PREFS_DOMAIN));
+        gIgnoredApplications = [ignoredValue isKindOfClass:[NSDictionary class]] ? ignoredValue : @{};
+        id value = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_APPLICATIONS, PREFS_DOMAIN));
+        gApplications = [value isKindOfClass:[NSDictionary class]] ? value : @{};
+        id settleValue = CFBridgingRelease(CFPreferencesCopyAppValue(KEY_SETTLE_APPLICATIONS, PREFS_DOMAIN));
+        gSettleApplications = [settleValue isKindOfClass:[NSDictionary class]] ? settleValue : @{};
+        NSMutableDictionary *records = [gApplications mutableCopy];
+        NSMutableDictionary *settleRecords = [gSettleApplications mutableCopy];
+        for (NSString *bundleID in gApplications) {
+            id entry = gApplications[bundleID];
+            if ([entry isKindOfClass:[NSDictionary class]] && entry[@"settle"]) {
+                id settle = entry[@"settle"];
+                if (!ignored(bundleID) && [settle isKindOfClass:[NSNumber class]] && [settle boolValue] &&
+                    ![settleRecords[bundleID] isKindOfClass:[NSDictionary class]]) {
+                    id name = entry[@"name"];
+                    settleRecords[bundleID] = @{ @"name": [name isKindOfClass:[NSString class]] ? name : bundleID };
+                }
+                NSMutableDictionary *updated = [entry mutableCopy];
+                [updated removeObjectForKey:@"settle"];
+                records[bundleID] = updated;
             }
-            NSMutableDictionary *updated = [entry mutableCopy];
-            [updated removeObjectForKey:@"settle"];
-            records[bundleID] = updated;
+            id fullscreen = [entry isKindOfClass:[NSDictionary class]] ? entry[@"fullscreen"] : nil;
+            if (gReopenInFullScreen && (ignored(bundleID) || ![fullscreen isKindOfClass:[NSNumber class]] || ![fullscreen boolValue]))
+                [records removeObjectForKey:bundleID];
         }
-        id fullscreen = [entry isKindOfClass:[NSDictionary class]] ? entry[@"fullscreen"] : nil;
-        if (gReopenInFullScreen && (ignored(bundleID) || ![fullscreen isKindOfClass:[NSNumber class]] || ![fullscreen boolValue]))
-            [records removeObjectForKey:bundleID];
-    }
-    if (![settleRecords isEqual:gSettleApplications]) {
-        gSettleApplications = settleRecords;
-        if (saveChanges) CFPreferencesSetAppValue(KEY_SETTLE_APPLICATIONS, (__bridge CFDictionaryRef)settleRecords, PREFS_DOMAIN);
-    }
-    if (![records isEqual:gApplications]) {
-        if (saveChanges) saveApplications(records);
-        else gApplications = records;
-    }
+        if (![settleRecords isEqual:gSettleApplications]) {
+            gSettleApplications = settleRecords;
+            if (saveChanges) CFPreferencesSetAppValue(KEY_SETTLE_APPLICATIONS, (__bridge CFDictionaryRef)settleRecords, PREFS_DOMAIN);
+        }
+        if (![records isEqual:gApplications]) {
+            if (saveChanges) saveApplications(records);
+            else gApplications = records;
+        }
+    });
 }
 
 static WindowState remembered(NSString *bundleID) {
@@ -495,18 +523,20 @@ static WindowState remembered(NSString *bundleID) {
 
 static void saveState(NSRunningApplication *app, WindowState state) {
     if (!gReopenInFullScreen || app.terminated || state == StateUnknown) return;
-    loadSettings();  // merge with entries forgotten in the settings window
-    if (!gReopenInFullScreen || !eligible(app)) return;
-    if (remembered(app.bundleIdentifier) == state) return;
-    NSMutableDictionary *records = [gApplications mutableCopy];
-    if (state == StateFullscreen)
-        records[app.bundleIdentifier] = @{ @"name": app.localizedName ?: app.bundleIdentifier, @"fullscreen": @YES };
-    else
-        [records removeObjectForKey:app.bundleIdentifier];
-    if (app.terminated) return;
-    saveApplications(records);
-    DIAG(@"%s pid=%d bundle=%@",
-                state == StateFullscreen ? "save" : "remove", app.processIdentifier, app.bundleIdentifier);
+    withSettingsLock(YES, ^{
+        loadSettings();  // merge with entries forgotten in the settings window
+        if (!gReopenInFullScreen || !eligible(app)) return;
+        if (remembered(app.bundleIdentifier) == state) return;
+        NSMutableDictionary *records = [gApplications mutableCopy];
+        if (state == StateFullscreen)
+            records[app.bundleIdentifier] = @{ @"name": app.localizedName ?: app.bundleIdentifier, @"fullscreen": @YES };
+        else
+            [records removeObjectForKey:app.bundleIdentifier];
+        if (app.terminated) return;
+        saveApplications(records);
+        DIAG(@"%s pid=%d bundle=%@",
+                    state == StateFullscreen ? "save" : "remove", app.processIdentifier, app.bundleIdentifier);
+    });
 }
 
 static WindowState recordApplication(NSRunningApplication *app, BOOL startup, const char *phase) {
@@ -1430,8 +1460,8 @@ int main(int argc, char **argv) {
             // Startup always reloads once more after all observers and feature resources are ready.
             if (!starting) { @autoreleasepool { settingsChanged(); } }
         }];
-        loadSettings();
         watchAppBundle();
+        loadSettings();
         [center addObserverForName:@"com.apple.accessibility.api" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
             (void)note;
             checkPermission();

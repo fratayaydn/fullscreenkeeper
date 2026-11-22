@@ -41,7 +41,7 @@ APP_SRC   := Sources/App/FullscreenKeeperApp.swift
 RELEASE_LOG_AGENT ?= $(BUILD)/fullscreenkeeperd-release-check
 RELEASE_LOG_APP   ?= $(BUILD)/FullscreenKeeper-release-check
 
-.PHONY: all test clean install uninstall signing-identity release-app dmg release updater-test-agent diagnostic FORCE release-log-check
+.PHONY: all test lock-stress-test clean install uninstall signing-identity release-app dmg release updater-test-agent diagnostic FORCE release-log-check
 
 all: $(APP)
 
@@ -126,6 +126,15 @@ test: $(BUILD)/policy-tests $(BUILD)/agent-tests $(BUILD)/updater-tests \
 	$(BUILD)/updater-tool-tests
 	$(BUILD)/notification-tests
 	$(BUILD)/diagnostic-tests
+
+# Run by hand: two processes write the real preferences system with the settings lock. It leaves an empty
+# io.github.fratayaydn.fullscreenkeeper.locktest.plist in ~/Library/Preferences.
+lock-stress-test: $(BUILD)/preferences-lock-tests
+	$(BUILD)/preferences-lock-tests
+
+$(BUILD)/preferences-lock-tests: Tests/preferences-lock.c
+	mkdir -p $(BUILD)
+	clang -std=c11 -O2 -Wall -Wextra -Werror -mmacosx-version-min=$(MIN_OS) -framework CoreFoundation $< -o $@
 
 $(BUILD)/policy-tests: Sources/Agent/Policy.c $(POLICY_HEADER) Tests/main.c
 	mkdir -p $(BUILD)

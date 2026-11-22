@@ -1,5 +1,6 @@
 // FullscreenKeeper.app: settings for the fullscreenkeeperd background agent.
 // Only the agent reads and changes other apps' windows.
+import Darwin
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -184,6 +185,21 @@ struct RememberedApp: Identifiable {
 
 // MARK: - Model
 
+// Reopen the file each time because an update replaces the app bundle.
+private func withSettingsLock<Value>(_ change: () -> Value) -> Value {
+    let path = Bundle.main.bundleURL.appendingPathComponent("Contents/Info.plist").path
+    var fd = open(path, O_RDONLY | O_CLOEXEC)
+    if fd >= 0 {
+        for attempt in 0...40 {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 { break }
+            if errno != EWOULDBLOCK || attempt == 40 { close(fd); fd = -1; break }
+            usleep(5000)
+        }
+    }
+    defer { if fd >= 0 { close(fd) } }
+    return change()
+}
+
 final class Model: ObservableObject {
     @Published var agentStatus = SMAppService.Status.notRegistered
     @Published private var permissions = AgentPermissions()
@@ -264,10 +280,14 @@ final class Model: ObservableObject {
         }
         lastUpdateCheck = defaults.object(forKey: "LastUpdateCheck") as? Date
         spaceEventsPath = defaults.string(forKey: "SpaceEventsPath")
-        let ignoredRecords = defaults.dictionary(forKey: "IgnoredApplications") as? [String: [String: Any]] ?? [:]
-        let records = defaults.dictionary(forKey: "Applications") as? [String: [String: Any]] ?? [:]
-        let fullscreenRecords = records.filter { $0.value["fullscreen"] as? Bool == true && ignoredRecords[$0.key] == nil }
-        if reopenInFullScreen && fullscreenRecords.count != records.count { saveApplications(fullscreenRecords) }
+        let (ignoredRecords, fullscreenRecords) = withSettingsLock {
+            defaults.synchronize()
+            let ignoredRecords = defaults.dictionary(forKey: "IgnoredApplications") as? [String: [String: Any]] ?? [:]
+            let records = defaults.dictionary(forKey: "Applications") as? [String: [String: Any]] ?? [:]
+            let fullscreenRecords = records.filter { $0.value["fullscreen"] as? Bool == true && ignoredRecords[$0.key] == nil }
+            if reopenInFullScreen && fullscreenRecords.count != records.count { saveApplications(fullscreenRecords) }
+            return (ignoredRecords, fullscreenRecords)
+        }
         applications = fullscreenRecords.map { id, entry in
             RememberedApp(id: id, name: entry["name"] as? String ?? id)
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -278,10 +298,12 @@ final class Model: ObservableObject {
 
     func forget(_ ids: Set<String>) {
         guard !ids.isEmpty else { return }
-        defaults.synchronize()
-        var records = defaults.dictionary(forKey: "Applications") ?? [:]
-        for id in ids { records.removeValue(forKey: id) }
-        saveApplications(records)
+        withSettingsLock {
+            defaults.synchronize()
+            var records = defaults.dictionary(forKey: "Applications") ?? [:]
+            for id in ids { records.removeValue(forKey: id) }
+            saveApplications(records)
+        }
         refresh()
     }
 
@@ -326,15 +348,17 @@ final class Model: ObservableObject {
 
     private func ignoreApplications(_ names: [String: String]) {
         guard !names.isEmpty else { return }
-        defaults.synchronize()
-        var ignoredRecords = defaults.dictionary(forKey: "IgnoredApplications") ?? [:]
-        var records = defaults.dictionary(forKey: "Applications") ?? [:]
-        for (id, name) in names {
-            ignoredRecords[id] = ["name": name]
-            records.removeValue(forKey: id)
+        withSettingsLock {
+            defaults.synchronize()
+            var ignoredRecords = defaults.dictionary(forKey: "IgnoredApplications") ?? [:]
+            var records = defaults.dictionary(forKey: "Applications") ?? [:]
+            for (id, name) in names {
+                ignoredRecords[id] = ["name": name]
+                records.removeValue(forKey: id)
+            }
+            defaults.set(ignoredRecords, forKey: "IgnoredApplications")
+            saveApplications(records)
         }
-        defaults.set(ignoredRecords, forKey: "IgnoredApplications")
-        saveApplications(records)
         refresh()
     }
 

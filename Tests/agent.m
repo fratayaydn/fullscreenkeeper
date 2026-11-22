@@ -683,6 +683,50 @@ static TestApplication *application(pid_t pid, BOOL saved) {
     return app;
 }
 
+static void settingsLocking(void) {
+    reset();
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSString *contents = [root stringByAppendingPathComponent:@"Contents"];
+    assert([files createDirectoryAtPath:contents withIntermediateDirectories:YES attributes:nil error:NULL]);
+    NSString *plist = [contents stringByAppendingPathComponent:@"Info.plist"];
+    assert([files createFileAtPath:plist contents:[NSData data] attributes:nil]);
+    strlcpy(gExecutable, [contents stringByAppendingPathComponent:@"MacOS/fullscreenkeeperd"].fileSystemRepresentation,
+            sizeof(gExecutable));
+    int probe = open(plist.fileSystemRepresentation, O_RDONLY);
+    assert(probe >= 0);
+    TestApplication *app = application(300, NO);
+    TestApplication *other = application(301, NO);
+    preferenceReadHook = ^{
+        saveState(other, StateFullscreen);
+        assert(flock(probe, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK);
+        app.terminated = YES;
+    };
+    saveState(app, StateFullscreen);
+    assert(saves == 1 && preferences[other.bundleIdentifier] && !preferences[app.bundleIdentifier]);
+    assert(flock(probe, LOCK_EX | LOCK_NB) == 0);
+    assert(flock(probe, LOCK_UN) == 0);
+
+    // An unchanged state also returns while holding the lock.
+    saveState(other, StateFullscreen);
+    assert(saves == 1 && flock(probe, LOCK_EX | LOCK_NB) == 0);
+    __block BOOL ran = NO;
+    withSettingsLock(YES, ^{ ran = YES; });
+    assert(ran);  // A bounded timeout keeps the existing unlocked behavior.
+    assert(flock(probe, LOCK_UN) == 0);
+    withSettingsLock(YES, ^{
+        assert(flock(probe, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK);
+    });
+    assert(flock(probe, LOCK_EX | LOCK_NB) == 0);
+    close(probe);
+    assert([files removeItemAtPath:plist error:NULL]);
+    ran = NO;
+    withSettingsLock(YES, ^{ ran = YES; });
+    assert(ran);
+    gExecutable[0] = 0;
+    assert([files removeItemAtPath:root error:NULL]);
+}
+
 static void reopenDefaults(void) {
     reset();
     loadSettings();
@@ -2915,6 +2959,7 @@ static void movedBundleKeepsWatch(void) {
 
 int main(void) {
     @autoreleasepool {
+        settingsLocking();
         updaterCommands();
         reopenDefaults();
         reopenOffAtStartup();
