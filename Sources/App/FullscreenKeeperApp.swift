@@ -535,14 +535,22 @@ final class Model: ObservableObject {
         defaults.set(true, forKey: reregistrationPendingKey)
         defaults.synchronize()
         DispatchQueue.global().async { [weak self, defaults] in
-            reregisterAgent()
-            if !agentIsRunning() { reregisterAgent() }
-            if FeatureSettings(defaults: defaults).registersAgent {
-                defaults.set(currentBuildID, forKey: registeredBuildKey)
+            var result = reregisterAgent()
+            if result != .skipped && !agentIsRunning() { result = reregisterAgent() }
+            if result != .failed {
+                let registersAgent = FeatureSettings(defaults: defaults).registersAgent
+                if result == .registered || registersAgent {
+                    defaults.set(currentBuildID, forKey: registeredBuildKey)
+                }
+                defaults.removeObject(forKey: reregistrationPendingKey)
+                defaults.synchronize()
             }
-            defaults.removeObject(forKey: reregistrationPendingKey)
-            defaults.synchronize()
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async {
+                if result == .failed {
+                    self?.errorMessage = "Could not enable FullscreenKeeper after the update. Close and reopen FullscreenKeeper to try again."
+                }
+                self?.refresh()
+            }
         }
     }
 }
@@ -911,9 +919,11 @@ func startAgentOnce() { launchctl(["kickstart", agentJob]) }
 
 func agentIsRunning() -> Bool { launchctl(["print", agentJob]).contains("state = running") }
 
+enum ReregistrationResult { case registered, skipped, failed }
+
 /// Unregister, wait until launchd has dropped the job, register and start once: the sequence that refreshes
 /// the agent's launch constraint after an update (see scripts/install.sh).
-func reregisterAgent() {
+func reregisterAgent() -> ReregistrationResult {
     try? setLoginItemsEnabled(false)
     for job in [updaterJob, agentJob] {
         for _ in 0..<70 {
@@ -922,10 +932,13 @@ func reregisterAgent() {
         }
     }
     Thread.sleep(forTimeInterval: 1)
-    guard FeatureSettings(defaults: .standard).registersAgent else { return }
+    guard FeatureSettings(defaults: .standard).registersAgent else { return .skipped }
     try? setLoginItemsEnabled(true)
+    let agent = SMAppService.agent(plistName: agentPlistName)
+    let success = agent.status == .enabled || agent.status == .requiresApproval
     startAgentOnce()
     Thread.sleep(forTimeInterval: 2)
+    return success ? .registered : .failed
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
