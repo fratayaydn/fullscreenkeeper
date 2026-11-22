@@ -932,7 +932,8 @@ func reregisterAgent() -> ReregistrationResult {
         }
     }
     Thread.sleep(forTimeInterval: 1)
-    guard FeatureSettings(defaults: .standard).registersAgent else { return .skipped }
+    guard FeatureSettings(defaults: .standard).registersAgent,
+          UserDefaults.standard.bool(forKey: reregistrationPendingKey) else { return .skipped }
     try? setLoginItemsEnabled(true)
     let agent = SMAppService.agent(plistName: agentPlistName)
     let success = agent.status == .enabled || agent.status == .requiresApproval
