@@ -208,6 +208,7 @@ final class Model: ObservableObject {
     private var activeObserver: NSObjectProtocol?
     private var statusReplyObserver: NSObjectProtocol?
     private var statusRequestID = UUID().uuidString
+    private var reregistering = false
 
     init() {
         statusReplyObserver = DistributedNotificationCenter.default().addObserver(
@@ -247,7 +248,7 @@ final class Model: ObservableObject {
         DistributedNotificationCenter.default().postNotificationName(
             Notification.Name("io.github.fratayaydn.fullscreenkeeper.StatusRequest"),
             object: statusRequestID, deliverImmediately: true)
-        agentStatus = agent.status
+        if !reregistering { agentStatus = agent.status }
         defaults.synchronize()
         let features = FeatureSettings(defaults: defaults)
         reopenInFullScreen = features.reopenInFullScreen
@@ -388,6 +389,7 @@ final class Model: ObservableObject {
     }
 
     private func setFeature(_ on: Bool, key: String) {
+        reregistering = false  // the user's choice is shown at once
         defaults.set(on, forKey: key)
         defaults.removeObject(forKey: reregistrationPendingKey)
         defaults.synchronize()
@@ -493,9 +495,10 @@ final class Model: ObservableObject {
     func checkPermissionAgain(agentAccessibility: Bool? = nil) {
         do {
             let restart = try permissions.check(agentAccessibility: agentAccessibility, run: runAgentCommand)
-            agentStatus = agent.status
+            let status = agent.status
+            if !reregistering { agentStatus = status }
             // Restart for a grant transition or a running agent with stale trust.
-            if restart && agentStatus == .enabled {
+            if restart && status == .enabled {
                 DispatchQueue.global().async { launchctl(["kickstart", "-k", agentJob]) }
             }
         } catch {
@@ -534,6 +537,8 @@ final class Model: ObservableObject {
         }
         defaults.set(true, forKey: reregistrationPendingKey)
         defaults.synchronize()
+        agentStatus = agent.status  // shown until the sequence ends
+        reregistering = true
         DispatchQueue.global().async { [weak self, defaults] in
             var result = reregisterAgent()
             if result != .skipped && !agentIsRunning() { result = reregisterAgent() }
@@ -546,6 +551,7 @@ final class Model: ObservableObject {
                 defaults.synchronize()
             }
             DispatchQueue.main.async {
+                self?.reregistering = false
                 if result == .failed {
                     self?.errorMessage = "Could not enable FullscreenKeeper after the update. Close and reopen FullscreenKeeper to try again."
                 }
